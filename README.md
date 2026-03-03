@@ -21,6 +21,8 @@ blend() → XGBoost calibrated output → Safe / Phishing verdict
 
 The following files exceed GitHub's size limit and are **not included in this repo**. Download `codex_qblock_large_files.tar.gz` from Google Drive and extract it from the repo root:
 
+https://drive.google.com/file/d/1y7U6NKN5blFS0trz3kcNX9fg3R8qRC0i/view?usp=sharing
+
 ```bash
 tar -xzf codex_qblock_large_files.tar.gz -C backend/artifacts/
 ```
