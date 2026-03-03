@@ -1,0 +1,39 @@
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ── Large data files (download from Google Drive — see README) ────────────────
+backend/artifacts/tranco_full.csv
+backend/artifacts/feature_matrix.csv
+backend/artifacts/feature_matrix.parquet
+backend/artifacts/feature_matrix.partial.csv
+backend/artifacts/*.tar.gz
+
+# ── Python ────────────────────────────────────────────────────────────────────
+backend/.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.so
+
+# ── Node / Next.js ────────────────────────────────────────────────────────────
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+
+# ── Environment / secrets ─────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+
+# ── Editors ───────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo

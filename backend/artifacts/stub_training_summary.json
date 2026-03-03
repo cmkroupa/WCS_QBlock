@@ -1,0 +1,39 @@
+{
+  "trained_at_utc": "2026-03-03T20:08:52.647198+00:00",
+  "matrix_path": "/Users/camk/Desktop/Codex_QBlock/backend/artifacts/feature_matrix.csv",
+  "rows": 886163,
+  "feature_count": 35,
+  "dropped_columns": [
+    "url"
+  ],
+  "target_column": "classification",
+  "models": {
+    "logreg": {
+      "model": "LogReg_STUB",
+      "trained_rows": 886163,
+      "input_features": 35,
+      "class_distribution": {
+        "0": 610815,
+        "1": 275348
+      }
+    },
+    "distilbert": {
+      "model": "DistilBERT_STUB",
+      "trained_rows": 886163,
+      "avg_url_length": 44.42815035157189,
+      "class_distribution": {
+        "0": 610815,
+        "1": 275348
+      }
+    },
+    "xgboost_blender": {
+      "model": "XGBoost_STUB",
+      "trained_rows": 886163,
+      "input_features": 35,
+      "class_distribution": {
+        "0": 610815,
+        "1": 275348
+      }
+    }
+  }
+}
