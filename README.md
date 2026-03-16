@@ -20,16 +20,28 @@ cd backend
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-```
-
-If you want Playwright (renders JS-heavy pages, recommended):
-```bash
 python3 -m playwright install chromium
 ```
 
 ---
 
-## 2. Train the model
+## 2. Training data
+
+The dataset (10,296 HTML files, 2.7 GB) is not included in this repo. Download it from Google Drive:
+
+**[Download qblock_training_data.zip](https://drive.google.com/file/d/1YJ0FjIGg3hiB46Gg8aZ7It6ZkkP5zlgo/view?usp=sharing)**
+
+Extract into the backend directory:
+
+```bash
+unzip qblock_training_data.zip -d backend/
+```
+
+This places files at `backend/data/training/Phish/` and `backend/data/training/NotPhish/`.
+
+---
+
+## 3. Train the model
 
 Training data goes in:
 ```
@@ -63,7 +75,7 @@ Outputs written to `backend/artifacts/`:
 
 ---
 
-## 3. Start the backend
+## 4. Start the backend
 
 ```bash
 cd backend
@@ -77,7 +89,6 @@ Runs on `http://localhost:5001`.
 
 | Constant | Default | Effect |
 |---|---|---|
-| `PLAYWRIGHT` | `False` | Use headless Chromium instead of `requests.get()` — needed for JS-rendered sites |
 | `USE_URL_RISK` | `False` | Blend URL structural signals into the final score |
 | `USE_HTML_OVERRIDE` | `False` | Hard rules that can override the model (credential forms, iframes, etc.) |
 
@@ -85,7 +96,7 @@ Flip to `True` and restart to enable.
 
 ---
 
-## 4. Frontend
+## 5. Frontend
 
 ```bash
 cd frontend
@@ -104,7 +115,7 @@ QR code decoded in browser
          ↓
     URL extracted
          ↓
-    Page fetched  ──── requests.get()  or  Playwright (PLAYWRIGHT=True)
+    Page fetched  ──── Playwright (headless Chromium, executes JS)
          ↓
     HTML parsed
          ↓

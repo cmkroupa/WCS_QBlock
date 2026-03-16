@@ -2,6 +2,7 @@
 app.py – QBlock phishing detection API.
 
 Requires artifacts/model.joblib (produced by train.py).
+Requires Playwright:  pip install playwright && python3 -m playwright install chromium
 
 Endpoints:
     POST /api/scan   { "url": "..." }  →  phishing verdict + branch scores
@@ -20,25 +21,14 @@ os.environ.setdefault("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES")
 
 import joblib
 import numpy as np
-import requests as http_requests
 import shap
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 # ── Feature switches ──────────────────────────────────────────────────────────
-# PLAYWRIGHT        True  → headless Chromium (executes JS, sees real DOM)
-#                   False → plain requests.get() (fast but gets SPA shells)
-#
 # USE_URL_RISK      True  → blend URL structural signals into final score
-#                   False → model score only, no URL heuristics
-#
 # USE_HTML_OVERRIDE True  → hard rules override score for credential forms,
 #                           iframes, obfuscated content, etc.
-#                   False → model score only, no rule-based overrides
-#
-# To install Playwright:
-#   pip install playwright && playwright install chromium
-PLAYWRIGHT        = False
 USE_URL_RISK      = False
 USE_HTML_OVERRIDE = False
 
@@ -125,21 +115,7 @@ def compute_shap(Xn, numeric_cols, meta_input):
     return {"numeric_top": top8, "meta_contributions": meta_contribs}
 
 
-def _fetch_requests(url: str) -> str:
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/122.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-    }
-    resp = http_requests.get(url, timeout=15, headers=headers, allow_redirects=True)
-    return resp.text[:500_000]
-
-
-def _fetch_playwright(url: str) -> str:
+def fetch_html(url: str) -> str:
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
     with sync_playwright() as pw:
@@ -170,13 +146,6 @@ def _fetch_playwright(url: str) -> str:
         html = page.content()
         browser.close()
     return html[:500_000]
-
-
-def fetch_html(url: str) -> str:
-    if PLAYWRIGHT:
-        print(f"[fetch] Playwright → {url}")
-        return _fetch_playwright(url)
-    return _fetch_requests(url)
 
 
 THRESHOLD   = 0.50   # final verdict threshold
