@@ -3,7 +3,9 @@
 .AppleDouble
 .LSOverride
 
-# ── Large data files (download from Google Drive — see README) ────────────────
+# ── Large data / model files (too large for GitHub) ──────────────────────────
+backend/data/
+backend/artifacts/emb_cache.npz
 backend/artifacts/tranco_full.csv
 backend/artifacts/feature_matrix.csv
 backend/artifacts/feature_matrix.parquet

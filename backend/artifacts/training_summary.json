@@ -1,0 +1,49 @@
+{
+  "n_files": 10296,
+  "n_phishing": 4207,
+  "n_benign": 6089,
+  "auc_xgb_numeric": 0.9832,
+  "auc_bert": 0.9886,
+  "auc_meta": 0.9905,
+  "params_numeric": {
+    "max_depth": 4,
+    "learning_rate": 0.05,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "min_child_weight": 1,
+    "gamma": 0.1,
+    "reg_alpha": 1.0,
+    "reg_lambda": 1.0
+  },
+  "params_bert": {
+    "max_depth": 4,
+    "learning_rate": 0.05,
+    "subsample": 0.7,
+    "colsample_bytree": 0.7,
+    "min_child_weight": 5,
+    "gamma": 0.3,
+    "reg_alpha": 1.0,
+    "reg_lambda": 1.0
+  },
+  "numeric_columns": [
+    "raw_len",
+    "shannon_entropy",
+    "count_tag__a",
+    "count_tag__img",
+    "count_tag__script",
+    "count_tag__iframe",
+    "count_tag__form",
+    "count_tag__input",
+    "count_tag__link",
+    "count_tag__meta",
+    "count_tag__button",
+    "count_tag__svg",
+    "num_unique_tags",
+    "max_dom_depth",
+    "visible_len",
+    "count_external_links",
+    "count_internal_links",
+    "count_unique_link_domains",
+    "ratio_external_links"
+  ]
+}

@@ -1,6 +1,13 @@
 Flask==3.1.0
+flask-cors
 requests==2.32.3
-polars
-huggingface_hub
+numpy
 pandas==2.2.3
-tldextract
+scikit-learn
+xgboost
+transformers
+torch
+beautifulsoup4
+lxml
+joblib
+tqdm
