@@ -143,13 +143,6 @@ _URL_SENSITIVE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Strip <script>/<style> from HTML before building the embedding soup so JS/CSS
-# bytes don't consume the 512-token RoBERTa budget.
-_SCRIPT_STYLE_RE = re.compile(
-    r"<(script|style)[^>]*?>.*?</(script|style)>",
-    re.IGNORECASE | re.DOTALL,
-)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Module-level helpers
@@ -384,28 +377,28 @@ class HTMLFeatureExtractor(BaseEstimator, TransformerMixin):
 
         seg_a = self._scrub_brands(_clean_whitespace(" ".join(head_parts))[: _APPROX_CHARS["A"]])
 
-        # ── Segment B: form intent ────────────────────────────────────────────
+        # ── Segment B: form intent (all forms) ───────────────────────────────
+        # Capture all forms — phishing pages often place the credential form
+        # below decoy content, so restricting to the first form loses signal.
         form_parts = []
-        form = soup.find("form")
-        if form:
-            # Walk up to the nearest non-structural ancestor for context —
-            # but stop before <body> or <html>, which would pull in the entire
-            # page and defeat the purpose of form-focused extraction.
-            parent = form.parent
-            if parent and parent.name not in ("body", "html", "[document]", None):
-                context_node = parent
-            else:
-                context_node = form
-            for el in context_node.find_all(
-                ["label", "input", "button", "select", "textarea", "a", "p", "span"]
-            ):
-                t = _clean_whitespace(el.get_text(" ", strip=True))
-                if t and len(t) < 200:
-                    form_parts.append(t)
-                for attr in ("placeholder", "value", "name", "aria-label"):
-                    v = el.get(attr, "")
-                    if v and len(v) < 100:
-                        form_parts.append(v)
+        forms = soup.find_all("form")
+        if forms:
+            for form in forms:
+                parent = form.parent
+                if parent and parent.name not in ("body", "html", "[document]", None):
+                    context_node = parent
+                else:
+                    context_node = form
+                for el in context_node.find_all(
+                    ["label", "input", "button", "select", "textarea", "a", "p", "span"]
+                ):
+                    t = _clean_whitespace(el.get_text(" ", strip=True))
+                    if t and len(t) < 200:
+                        form_parts.append(t)
+                    for attr in ("placeholder", "value", "name", "aria-label"):
+                        v = el.get(attr, "")
+                        if v and len(v) < 100:
+                            form_parts.append(v)
         else:
             for el in soup.find_all(["a", "button"]):
                 t = _clean_whitespace(el.get_text(" ", strip=True))
@@ -493,14 +486,23 @@ class HTMLFeatureExtractor(BaseEstimator, TransformerMixin):
             if input_names:
                 parts.append(f"FORM_INPUTS {' '.join(input_names)}")
 
-        # ── First 10 anchor links ─────────────────────────────────────────────
-        link_parts = []
-        for a in soup.find_all("a", href=True)[:10]:
+        # ── Links — all sensitive ones + first 10 others ─────────────────────
+        # Prioritise URL_EXT_SENSITIVE links regardless of position — phishing
+        # pages often bury the credential-harvesting link below decoy content.
+        link_parts  = []
+        sensitive   = []
+        other       = []
+        for a in soup.find_all("a", href=True):
             href_tok = _neutralize_url(a.get("href", ""))
             text     = self._scrub_brands(_clean_whitespace(a.get_text(" ", strip=True))[:50])
             entry    = f"{href_tok} {text}".strip()
-            if entry:
-                link_parts.append(entry)
+            if not entry:
+                continue
+            if href_tok == "URL_EXT_SENSITIVE":
+                sensitive.append(entry)
+            else:
+                other.append(entry)
+        link_parts = sensitive + other[:max(0, 10 - len(sensitive))]
         if link_parts:
             parts.append(f"LINKS {' | '.join(link_parts)}")
 
@@ -524,14 +526,15 @@ class HTMLFeatureExtractor(BaseEstimator, TransformerMixin):
         return -sum(p * math.log2(p) for p in probs if p > 0)
 
     def _max_depth(self, soup):
-        maxd = 0
-        def depth(node, cur):
-            nonlocal maxd
+        """Iterative DOM depth — avoids RecursionError on adversarially deep pages."""
+        maxd  = 0
+        stack = [(soup, 0)]
+        while stack:
+            node, cur = stack.pop()
             maxd = max(maxd, cur)
             for c in getattr(node, "contents", []):
                 if getattr(c, "name", None):
-                    depth(c, cur + 1)
-        depth(soup, 0)
+                    stack.append((c, cur + 1))
         return maxd
 
     def _link_features(self, soup):
@@ -598,7 +601,10 @@ def _process_single_html(html_text: str) -> tuple:
     ex = HTMLFeatureExtractor()
 
     soup       = _parse_html(html_text)
-    soup_embed = _parse_html(_SCRIPT_STYLE_RE.sub("", html_text))
+    # Use BS4 decompose — more robust than regex stripping on malformed HTML
+    soup_embed = _parse_html(html_text)
+    for tag in soup_embed(["script", "style", "noscript"]):
+        tag.decompose()
 
     # ── Numeric features ──────────────────────────────────────────────────────
     doc = {}
@@ -618,6 +624,40 @@ def _process_single_html(html_text: str) -> tuple:
     ext, intern = ex._link_features(soup)
     doc["count_external_links"] = ext
     doc["count_internal_links"] = intern
+
+    # ── High-signal phishing features ─────────────────────────────────────────
+    # Password / hidden inputs — direct credential-harvesting indicators
+    all_inputs = soup.find_all("input")
+    doc["count_password_inputs"] = sum(
+        1 for i in all_inputs if (i.get("type") or "").lower() == "password"
+    )
+    doc["count_hidden_inputs"] = sum(
+        1 for i in all_inputs if (i.get("type") or "").lower() == "hidden"
+    )
+
+    # POST-method forms — phishing pages almost always POST credentials
+    doc["count_forms_post"] = sum(
+        1 for f in soup.find_all("form")
+        if (f.get("method") or "get").lower() == "post"
+    )
+
+    # Meta refresh — common in phishing redirect chains
+    doc["count_meta_refresh"] = sum(
+        1 for m in soup.find_all("meta")
+        if (m.get("http-equiv") or "").lower() == "refresh"
+    )
+
+    # javascript: hrefs — obfuscation / credential interception
+    doc["count_javascript_hrefs"] = sum(
+        1 for a in soup.find_all("a", href=True)
+        if a["href"].strip().lower().startswith("javascript")
+    )
+
+    # data: URIs in img/embed/iframe — inline resource obfuscation
+    doc["count_data_uris"] = sum(
+        1 for tag in soup.find_all(["img", "iframe", "embed", "source"])
+        if (tag.get("src") or "").strip().lower().startswith("data:")
+    )
 
     visible_text = ex._smart_embed_text(soup_embed)
     struct_core  = ex._structural_core(soup_embed)

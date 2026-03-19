@@ -41,7 +41,7 @@ BERT_CLF_META  = ARTIFACTS_DIR / "bert_clf_meta.npz"
 MINHASH_CACHE  = ARTIFACTS_DIR / "minhash_cache.pkl"
 _MINHASH_NUM_PERM = 128
 
-PREPROCESSING_VERSION = "v3"
+PREPROCESSING_VERSION = "v4"
 
 
 def _xgb_gpu_kwargs() -> dict:
