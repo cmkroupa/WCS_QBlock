@@ -5,14 +5,13 @@
 
 # ── Large data / model files (too large for GitHub) ──────────────────────────
 backend/data/
-backend/artifacts/model.joblib
-backend/artifacts/emb_cache.npz
-backend/artifacts/minhash_cache.pkl
-backend/artifacts/tranco_full.csv
-backend/artifacts/feature_matrix.csv
-backend/artifacts/feature_matrix.parquet
-backend/artifacts/feature_matrix.partial.csv
+backend/artifacts/*.joblib
+backend/artifacts/*.npz
+backend/artifacts/*.pkl
+backend/artifacts/*.pt
 backend/artifacts/*.tar.gz
+backend/artifacts/*.csv
+backend/artifacts/*.parquet
 
 
 # ── Python ────────────────────────────────────────────────────────────────────
