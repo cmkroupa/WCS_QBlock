@@ -751,7 +751,7 @@ class PhishBERTClassifier:
         model = _Model(backbone, self.dropout, hidden_size)
         return tokenizer, model
 
-    def _make_loader(self, texts, labels=None, shuffle=False):
+    def _make_loader(self, texts, labels=None, shuffle=False, override_batch=None):
         """Tokenise texts and return a DataLoader."""
         import torch
         from torch.utils.data import DataLoader
@@ -765,11 +765,10 @@ class PhishBERTClassifier:
         )
         lbl = torch.tensor(labels, dtype=torch.float32) if labels is not None else None
         ds  = _PhishBERTDataset(enc["input_ids"], enc["attention_mask"], lbl)
-        return DataLoader(
-            ds,
-            batch_size=self.batch_size if shuffle else self.batch_size * 2,
-            shuffle=shuffle,
+        bs  = override_batch if override_batch is not None else (
+            self.batch_size if shuffle else self.batch_size * 2
         )
+        return DataLoader(ds, batch_size=bs, shuffle=shuffle)
 
     def _raw_logits(self, loader):
         """Run the model in eval mode and return concatenated logits."""
@@ -801,15 +800,24 @@ class PhishBERTClassifier:
 
         torch.manual_seed(self.random_state)
 
+        n_gpu = get_n_gpu()
         print(
             f"[bert] Building PhishBERT "
-            f"(unfreeze_layers={self.n_unfreeze_layers}, device={self.device})…"
+            f"(unfreeze_layers={self.n_unfreeze_layers}, device={self.device}"
+            + (f", {n_gpu} GPUs" if n_gpu > 1 else "") + ")…"
         )
         self._tokenizer, self._model = self._build()
         self._model = self._model.to(self.device)
+        if self.device == "cuda" and n_gpu > 1:
+            print(f"[bert] Wrapping in DataParallel ({n_gpu} GPUs)")
+            self._model = nn.DataParallel(self._model)
+
+        # Scale batch size across GPUs so each GPU sees self.batch_size samples
+        effective_batch = self.batch_size * max(1, n_gpu)
 
         print(f"[bert] Tokenising {len(texts)} training samples…")
-        train_loader = self._make_loader(texts, y, shuffle=True)
+        train_loader = self._make_loader(texts, y, shuffle=True,
+                                         override_batch=effective_batch)
         val_loader   = (
             self._make_loader(val_texts, val_y) if val_texts is not None else None
         )
@@ -853,7 +861,9 @@ class PhishBERTClassifier:
                 )
                 loss = criterion(logits, batch["labels"].to(self.device))
                 loss.backward()
-                nn.utils.clip_grad_norm_(self._model.parameters(), 1.0)
+                _params = (self._model.module if hasattr(self._model, "module")
+                           else self._model).parameters()
+                nn.utils.clip_grad_norm_(_params, 1.0)
                 optimizer.step()
                 scheduler.step()
                 total_loss += loss.item()
@@ -868,7 +878,8 @@ class PhishBERTClassifier:
                 )
                 if val_auc > best_val_auc:
                     best_val_auc = val_auc
-                    best_state   = {k: v.cpu().clone() for k, v in self._model.state_dict().items()}
+                    _raw = self._model.module if hasattr(self._model, "module") else self._model
+                    best_state   = {k: v.cpu().clone() for k, v in _raw.state_dict().items()}
                     no_improve   = 0
                 else:
                     no_improve += 1
@@ -893,9 +904,11 @@ class PhishBERTClassifier:
 
     def save(self, path):
         import torch
+        # Unwrap DataParallel before saving so the checkpoint is device-agnostic
+        raw_model = self._model.module if hasattr(self._model, "module") else self._model
         torch.save(
             {
-                "model_state": self._model.state_dict(),
+                "model_state": raw_model.state_dict(),
                 "config": {
                     "model_name":        self.model_name,
                     "n_unfreeze_layers": self.n_unfreeze_layers,
@@ -938,13 +951,23 @@ def get_device():
     return "cpu"
 
 
+def get_n_gpu():
+    """Return number of usable CUDA GPUs (0 if none)."""
+    import torch
+    return torch.cuda.device_count() if torch.cuda.is_available() else 0
+
+
 def get_transformer(device=None):
     import torch
     from transformers import AutoTokenizer, AutoModel
     device = device or get_device()
+    n_gpu  = get_n_gpu()
     print(f"[model] Loading {TRANSFORMER_NAME} on {device}...")
     tokenizer   = AutoTokenizer.from_pretrained(TRANSFORMER_NAME)
     transformer = AutoModel.from_pretrained(TRANSFORMER_NAME).to(device)
+    if device == "cuda" and n_gpu > 1:
+        print(f"[model] Wrapping transformer in DataParallel ({n_gpu} GPUs)")
+        transformer = torch.nn.DataParallel(transformer)
     transformer.eval()
     return tokenizer, transformer, device
 
@@ -952,16 +975,20 @@ def get_transformer(device=None):
 def embed_texts(tokenizer, transformer, device, texts,
                 batch_size=EMB_BATCH_SIZE, desc="Embedding"):
     import torch
+    # Scale batch size across all available GPUs
+    n_gpu          = get_n_gpu()
+    effective_bs   = batch_size * max(1, n_gpu)
     all_embs = []
-    for i in tqdm(range(0, len(texts), batch_size), desc=desc, leave=False):
-        batch = texts[i:i + batch_size]
+    for i in tqdm(range(0, len(texts), effective_bs), desc=desc, leave=False):
+        batch = texts[i:i + effective_bs]
         enc   = tokenizer(batch, padding=True, truncation=True,
                           max_length=512, return_tensors="pt")
         input_ids = enc["input_ids"].to(device)
         mask      = enc["attention_mask"].to(device)
         with torch.no_grad():
             out  = transformer(input_ids, attention_mask=mask)
-            last = out.last_hidden_state
+            # DataParallel may return a plain tuple; handle both cases
+            last = out[0] if isinstance(out, (tuple, list)) else out.last_hidden_state
             m    = mask.unsqueeze(-1).expand(last.size()).float()
             emb  = (last * m).sum(1) / m.sum(1).clamp(min=1e-9)
             all_embs.append(emb.cpu().numpy())

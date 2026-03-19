@@ -43,6 +43,17 @@ _MINHASH_NUM_PERM = 128
 
 PREPROCESSING_VERSION = "v3"
 
+
+def _xgb_gpu_kwargs() -> dict:
+    """Return XGBoost GPU kwargs when CUDA is available, empty dict otherwise."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return {"device": "cuda", "tree_method": "hist"}
+    except ImportError:
+        pass
+    return {}
+
 N_ESTIMATORS_MAX = 1000
 EARLY_STOPPING_ROUNDS = 100
 
@@ -203,6 +214,7 @@ def _eval_xgb_combo(combo, X_tr, y_tr, scale_pos_weight):
         )
         m = xgb.XGBClassifier(
             **combo,
+            **_xgb_gpu_kwargs(),
             n_estimators=N_ESTIMATORS_MAX,
             early_stopping_rounds=EARLY_STOPPING_ROUNDS,
             eval_metric="logloss",
@@ -237,6 +249,7 @@ def _oof_fold_worker(
 ):
     tmp_a = xgb.XGBClassifier(
         **params_a,
+        **_xgb_gpu_kwargs(),
         n_estimators=N_ESTIMATORS_MAX,
         early_stopping_rounds=EARLY_STOPPING_ROUNDS,
         eval_metric="logloss",
@@ -307,6 +320,7 @@ def tune_xgb(X_tr, y_tr, param_grid, label="", scale_pos_weight=1.0):
     # Refit on full X_tr — no val set, no early stopping
     best_model = xgb.XGBClassifier(
         **best_params,
+        **_xgb_gpu_kwargs(),
         n_estimators=best_n_trees,
         scale_pos_weight=scale_pos_weight,
         random_state=RANDOM_SEED,
