@@ -19,6 +19,7 @@ Examples:
 import argparse
 import re
 import sys
+from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
@@ -95,13 +96,12 @@ def visible_text(html: str) -> str:
 def print_features(html: str, url: str):
     """Import model.py and run HTMLFeatureExtractor on the fetched HTML."""
     try:
-        sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).parent))
         from model import HTMLFeatureExtractor
         extractor = HTMLFeatureExtractor()
-        rows = extractor.transform([html], urls=[url])
-        cols = extractor.feature_names_out_ if hasattr(extractor, "feature_names_out_") else [f"f{i}" for i in range(rows.shape[1])]
-        print("\n── HTML Features (" + str(len(cols)) + " total) " + "─" * 40)
-        for name, val in zip(cols, rows[0]):
+        df, _ = extractor.transform([html])
+        print("\n── HTML Features (" + str(len(df.columns)) + " total) " + "─" * 40)
+        for name, val in df.iloc[0].items():
             print(f"  {name:<35} {val:.4f}")
     except Exception as exc:
         print(f"\n[features] Could not extract — {exc}")

@@ -11,3 +11,6 @@ beautifulsoup4
 lxml
 joblib
 tqdm
+datasketch
+shap
+playwright

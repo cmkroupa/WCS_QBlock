@@ -10,28 +10,33 @@ Endpoints:
 
 Start:
     python3 app.py
+
+Inference pipeline (mirrors train.py preprocessing exactly):
+    raw HTML
+      → HTMLFeatureExtractor   → numeric features
+                                    → StandardScaler        [bundle["scaler"]]
+                                    → Voter A XGBoost       → P_xgb
+      → XLM-RoBERTa (vis + struct)  → embeddings (1536-dim)
+                                    → PCA(128)              [bundle["pca"]]
+                                    → Voter B LogisticReg   → P_lr
+      → [P_xgb, P_lr]               → Meta LogisticRegression + Platt calibration
+                                    → final score
 """
 
 import os
 from pathlib import Path
 
 # Python 3.14 + macOS ARM64: fork() after loading torch causes SIGSEGV at shutdown.
-# This env var tells the OS not to enforce fork safety checks, preventing the crash.
 os.environ.setdefault("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES")
 
 import joblib
 import numpy as np
 import shap
+from bs4 import BeautifulSoup
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-# ── Feature switches ──────────────────────────────────────────────────────────
-# USE_URL_RISK      True  → blend URL structural signals into final score
-# USE_HTML_OVERRIDE True  → hard rules override score for credential forms,
-#                           iframes, obfuscated content, etc.
-USE_URL_RISK      = False
-USE_HTML_OVERRIDE = False
-
+from helpers import fetch_html, label
 from model import HTMLFeatureExtractor, embed_texts, get_transformer, url_risk_score
 
 ARTIFACTS_DIR = Path(__file__).parent / "artifacts"
@@ -41,12 +46,11 @@ app = Flask(__name__)
 CORS(app)
 
 # ── Lazy-loaded globals ───────────────────────────────────────────────────────
-_bundle           = None
-_tokenizer        = None
-_transformer      = None
-_device           = None
-_explainer_numeric = None   # shap.TreeExplainer for Voter A
-_explainer_meta    = None   # shap.TreeExplainer for Meta blender
+_bundle            = None
+_tokenizer         = None
+_transformer       = None
+_device            = None
+_explainer_numeric = None   # shap.TreeExplainer for Voter A (XGBoost)
 
 
 def load_model():
@@ -57,7 +61,7 @@ def load_model():
                 f"No model found at {MODEL_PATH}. "
                 "Train one first:  python3 train.py data/training"
             )
-        print(f"[app] Loading model from {MODEL_PATH}...")
+        print(f"[app] Loading model from {MODEL_PATH}…")
         _bundle = joblib.load(MODEL_PATH)
         print("[app] Model ready.")
     return _bundle
@@ -71,239 +75,172 @@ def load_transformer():
 
 
 def get_explainers():
-    """Return (explainer_numeric, explainer_meta), built once and cached."""
-    global _explainer_numeric, _explainer_meta
+    """Return explainer_numeric (TreeExplainer on Voter A), built once and cached."""
+    global _explainer_numeric
     if _explainer_numeric is None:
         bundle = load_model()
-        # TreeExplainer is exact and fast for XGBoost — no background samples needed.
         _explainer_numeric = shap.TreeExplainer(bundle["xgb_numeric"])
-        _explainer_meta    = shap.TreeExplainer(bundle["xgb_meta"])
-        print("[app] SHAP explainers ready.")
-    return _explainer_numeric, _explainer_meta
+        print("[app] SHAP explainer ready.")
+    return _explainer_numeric
 
 
-def compute_shap(Xn, numeric_cols, meta_input):
+def compute_shap(Xn_raw, Xn_scaled, numeric_cols, meta_input):
     """
-    Returns a dict ready to send to the frontend:
-      numeric_top  — top 8 HTML features by |SHAP|, with name/raw-value/shap-impact
-      meta         — how much each voter (A numeric, B bert) drove the final score
+    Return a dict ready to send to the frontend:
+      numeric_top  — top 8 HTML features by |SHAP|, with feature name,
+                     original (unscaled) raw value, and SHAP impact.
+      meta         — per voter: learned LR weight, input probability, and
+                     per-sample contribution (weight × P, in log-odds units).
+
+    Parameters
+    ----------
+    Xn_raw    : np.ndarray (1, n_features)  — unscaled numeric features (for display)
+    Xn_scaled : np.ndarray (1, n_features)  — scaled numeric features   (for SHAP)
+    numeric_cols : list[str]
+    meta_input   : np.ndarray (1, 2)        — [P_xgb, P_lr]
     """
-    exp_num, exp_meta = get_explainers()
+    exp_num = get_explainers()
 
-    # Voter A SHAP — shape (1, n_features), positive = pushes toward phishing
-    sv_num  = exp_num.shap_values(Xn)[0]           # 1-D array, one value per feature
-    sv_meta = exp_meta.shap_values(meta_input)[0]   # 2-D → [shap_P_xgb, shap_P_bert]
+    # Voter A SHAP — computed on scaled features (same space the model trained on).
+    # shap_values() output differs by version:
+    #   SHAP <0.40  → list [neg_class_vals, pos_class_vals], each (n_samples, n_features)
+    #   SHAP ≥0.40  → single ndarray (n_samples, n_features) for the positive class
+    _sv_raw = exp_num.shap_values(Xn_scaled)
+    if isinstance(_sv_raw, list):
+        # Take positive-class values for the single sample
+        sv_num = np.array(_sv_raw[1])[0]
+    else:
+        sv_num = np.array(_sv_raw)[0]
 
-    # Build ranked list of numeric features
+    # Meta contributions — expose the LR coefficients directly so the frontend
+    # can show the model's learned trust in each voter, plus the per-sample
+    # contribution (coef × P) in log-odds units.
+    meta_lr    = load_model()["meta_lr"]
+    coefs      = meta_lr.coef_[0]                        # [w_xgb, w_lr]
+    probs      = meta_input[0]                           # [P_xgb, P_lr]
+    contribs   = (coefs * probs).tolist()                # per-sample log-odds push
+
     pairs = sorted(
-        zip(numeric_cols, Xn[0].tolist(), sv_num.tolist()),
+        zip(numeric_cols, Xn_raw[0].tolist(), sv_num.tolist()),
         key=lambda x: abs(x[2]),
         reverse=True,
     )
-    top8 = [
-        {"feature": name, "raw_value": round(float(raw), 4), "impact": round(float(sv), 4)}
-        for name, raw, sv in pairs[:8]
+    shap_features = [
+        {
+            "feature":   name,
+            "raw_value": round(float(raw), 4),
+            "impact":    round(float(sv),  4),
+        }
+        for name, raw, sv in pairs          # all features, sorted by |SHAP|
     ]
 
-    # Meta contributions — which voter pushed the final score more
-    meta_shap_names = ["XGBoost (HTML features)", "XGBoost (BERT embeddings)"]
+    meta_shap_names = [
+        "XGBoost (HTML numeric features)",
+        "LogisticRegression (BERT embeddings)",
+    ]
     meta_contribs = [
-        {"voter": name, "impact": round(float(sv), 4)}
-        for name, sv in zip(meta_shap_names, sv_meta.tolist())
+        {
+            "voter":       name,
+            "weight":      round(float(coef), 4),   # learned LR coefficient
+            "probability": round(float(prob), 4),   # this sample's voter score
+            "impact":      round(float(contrib), 4),# weight × probability (log-odds)
+        }
+        for name, coef, prob, contrib in zip(
+            meta_shap_names, coefs.tolist(), probs.tolist(), contribs
+        )
     ]
 
-    return {"numeric_top": top8, "meta_contributions": meta_contribs}
+    return {"numeric_top": shap_features, "meta_contributions": meta_contribs}
 
 
-def fetch_html(url: str) -> str:
-    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+def _core_inference(url: str) -> dict:
+    """
+    Run the full inference pipeline and return all intermediate values.
+    Called by both run_inference() and run_pipeline_inference() to avoid duplication.
+    """
+    # ── 1. Fetch HTML (follows redirects) ─────────────────────────────────────
+    html_text, final_url = fetch_html(url)
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        ctx = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            ),
-            locale="en-US",
-            # Don't load images or fonts — faster, same HTML content
-            java_script_enabled=True,
-        )
-        page = ctx.new_page()
+    # ── 2. URL structural risk — on final URL after redirects ─────────────────
+    url_score, url_signals = url_risk_score(final_url)
 
-        # Block images/fonts to speed up load — HTML content is unchanged
-        page.route("**/*.{png,jpg,jpeg,gif,webp,svg,ico,woff,woff2,ttf}", lambda r: r.abort())
+    # ── 3. Extract HTML numeric features ──────────────────────────────────────
+    df_num, extras = HTMLFeatureExtractor().transform([html_text])
+    vis          = extras["visible_texts"]
+    struct_cores = extras["struct_cores"]
 
+    # ── 4. Embed with XLM-RoBERTa (single pass for both channels) ─────────────
+    tok, trans, dev = load_transformer()
+    all_embs = embed_texts(tok, trans, dev, vis + struct_cores, desc="embedding")
+    emb_bert = np.hstack([all_embs[:1], all_embs[1:]]).astype(np.float32)  # (1, 1536)
+
+    # ── 5. Load model bundle ───────────────────────────────────────────────────
+    bundle       = load_model()
+    numeric_cols = bundle["numeric_columns"]
+    Xn_raw       = df_num[numeric_cols].fillna(0).values.astype(np.float32)
+
+    # ── 6. Stacking inference ──────────────────────────────────────────────────
+    Xn_scaled        = bundle["scaler"].transform(Xn_raw).astype(np.float32)
+    emb_bert_reduced = bundle["pca"].transform(emb_bert).astype(np.float32)
+
+    score_xgb  = float(bundle["xgb_numeric"].predict_proba(Xn_scaled)[0, 1])
+    score_bert = float(bundle["lr_bert"].predict_proba(emb_bert_reduced)[0, 1])
+    meta_input = np.array([[score_xgb, score_bert]], dtype=np.float32)
+
+    raw_meta_p  = bundle["meta_lr"].predict_proba(meta_input)[:, 1].reshape(-1, 1)
+    score_final = round(float(bundle["meta_calibrator"].predict_proba(raw_meta_p)[0, 1]), 4)
+
+    # ── 7. SHAP ────────────────────────────────────────────────────────────────
+    shap_data = None
+    if "xgb_numeric" in bundle:
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=20_000)
-            # Wait a moment for JS to populate the DOM (phishing kits often inject content)
-            page.wait_for_timeout(2_000)
-        except PWTimeout:
-            # Page timed out — grab whatever DOM loaded so far
-            print(f"[fetch] Playwright timeout for {url}, using partial DOM")
+            shap_data = compute_shap(Xn_raw, Xn_scaled, numeric_cols, meta_input)
+        except Exception as e:
+            print(f"[app] SHAP skipped: {e}")
 
-        html = page.content()
-        browser.close()
-    return html[:500_000]
-
-
-THRESHOLD   = 0.50   # final verdict threshold
-SUSPICIOUS  = 0.25   # shown as suspicious but not phishing
-
-
-def label(score: float) -> str:
-    if score >= THRESHOLD:
-        return "phishing"
-    if score >= SUSPICIOUS:
-        return "suspicious"
-    return "safe"
-
-
-def html_override(features: dict) -> tuple[bool, str]:
-    """
-    Detect specific phishing patterns directly from HTML features.
-    Returns (triggered: bool, reason: str).
-
-    These rules target known attack techniques, not a statistical threshold,
-    so legitimate complex pages (QR generators, dashboards) won't be caught.
-    """
-    form    = features.get("count_tag__form",        0)
-    input_  = features.get("count_tag__input",       0)
-    iframe  = features.get("count_tag__iframe",      0)
-    script  = features.get("count_tag__script",      0)
-    unique  = features.get("num_unique_tags",         0)
-    vis     = features.get("visible_len",             0)
-    entr    = features.get("shannon_entropy",         0)
-    ext     = features.get("count_external_links",   0)
-    anchors = features.get("count_tag__a",            0)
-    ratio   = features.get("ratio_external_links",   0.0)
-
-    # Rule 1 — Credential harvesting kit:
-    # Form + inputs + almost no text + zero external links
-    # Legit payment pages (Stripe, parking, etc.) always link out to privacy/terms/processor
-    if form >= 1 and input_ >= 3 and vis < 300 and ext == 0:
-        return True, "credential_harvest"
-
-    # Rule 2 — Hidden iframe injection:
-    # Multiple iframes = classic phishing/malware delivery
-    if iframe >= 2:
-        return True, "iframe_injection"
-
-    # Rule 3 — Obfuscated shell:
-    # High entropy (base64/encoded payloads) with almost no visible text
-    if entr > 5.8 and vis < 150:
-        return True, "obfuscated_content"
-
-    # Rule 4 — Script-only skeleton:
-    # Lots of scripts but very few unique HTML elements = automated phishing kit
-    if script > 15 and unique < 6:
-        return True, "script_skeleton"
-
-    # Rule 5 — Empty form farm:
-    # Multiple forms with essentially no content
-    if form >= 3 and vis < 100:
-        return True, "empty_form_farm"
-
-    # Rule 6 — Link isolation:
-    # Page has links but zero go outside → classic phishing trap (keeps victim on fake site)
-    if anchors >= 5 and ext == 0:
-        return True, "link_isolation"
-
-    # Rule 7 — No external links + credential form:
-    # Form with inputs and every link stays on-page
-    if form >= 1 and input_ >= 2 and ratio < 0.05 and anchors >= 3:
-        return True, "isolated_credential_form"
-
-    return False, ""
+    return {
+        "html_text":        html_text,
+        "final_url":        final_url,
+        "url_score":        url_score,
+        "url_signals":      url_signals,
+        "df_num":           df_num,
+        "vis":              vis,
+        "struct_cores":     struct_cores,
+        "emb_bert":         emb_bert,
+        "emb_bert_reduced": emb_bert_reduced,
+        "bundle":           bundle,
+        "numeric_cols":     numeric_cols,
+        "Xn_raw":           Xn_raw,
+        "Xn_scaled":        Xn_scaled,
+        "score_xgb":        score_xgb,
+        "score_bert":       score_bert,
+        "meta_input":       meta_input,
+        "score_final":      score_final,
+        "shap_data":        shap_data,
+    }
 
 
 def run_inference(url: str) -> dict:
-    # 0. URL structural risk — computed before any HTML fetch, never suffers from
-    #    bot challenges or distribution shift between saved training files and live pages
-    url_score, url_signals = url_risk_score(url)
-
-    # 1. Fetch HTML
-    html_text = fetch_html(url)
-
-    # 2. Extract HTML numeric features (pass url so link features work correctly)
-    extractor = HTMLFeatureExtractor()
-    df_num, extras = extractor.transform([html_text], urls=[url])
-    vis  = extras["visible_texts"]
-    tags = extras["tag_sequences"]
-
-    # 3. Embed with XLM-RoBERTa (visible text + tag sequence)
-    tok, trans, dev = load_transformer()
-    emb_vis  = embed_texts(tok, trans, dev, vis,  desc="vis")
-    emb_tag  = embed_texts(tok, trans, dev, tags, desc="tag")
-    emb_bert = np.hstack([emb_vis, emb_tag]).astype(np.float32)  # (1, 1536)
-
-    # 4. Load model bundle
-    bundle       = load_model()
-    numeric_cols = bundle["numeric_columns"]
-
-    Xn = df_num[numeric_cols].fillna(0).values.astype(np.float32)
-
-    # 5. Stacking inference (new model format)
-    if "xgb_meta" in bundle:
-        score_xgb  = float(bundle["xgb_numeric"].predict_proba(Xn)[0, 1])
-        score_bert = float(bundle["xgb_bert"].predict_proba(emb_bert)[0, 1])
-        meta_input = np.array([[score_xgb, score_bert]], dtype=np.float32)
-        score_final = float(bundle["xgb_meta"].predict_proba(meta_input)[0, 1])
-    else:
-        # Legacy model format (single XGBoost on [numeric | vis_emb | tag_emb])
-        X_full      = np.hstack([Xn, emb_bert])
-        score_final = float(bundle["model"].predict_proba(X_full)[0, 1])
-        # Approximate individual scores by zeroing out the other half
-        n_num       = bundle.get("n_numeric", len(numeric_cols))
-        X_a         = X_full.copy(); X_a[:, n_num:] = 0.0
-        X_b         = X_full.copy(); X_b[:, :n_num] = 0.0
-        score_xgb   = float(bundle["model"].predict_proba(X_a)[0, 1])
-        score_bert  = float(bundle["model"].predict_proba(X_b)[0, 1])
-
-    # HTML pattern override — specific attack signatures beat the blend
-    features      = df_num.iloc[0].to_dict()
-    override_hit, override_reason = html_override(features)
-    if USE_HTML_OVERRIDE and override_hit:
-        score_final = max(score_final, 0.85)   # hard floor, not a cap
-
-    # URL risk blend
-    if USE_URL_RISK:
-        if url_score >= 0.60:
-            score_final = max(score_final, 0.75)
-        elif url_score >= 0.30:
-            score_final = score_final * 0.60 + url_score * 0.40
-
-    score_final = round(score_final, 4)
-
-    # SHAP reasoning — only for stacking model (legacy path has no named numeric cols)
-    shap_data = None
-    if "xgb_meta" in bundle:
-        try:
-            shap_data = compute_shap(Xn, numeric_cols, meta_input)
-        except Exception as shap_err:
-            print(f"[app] SHAP skipped: {shap_err}")
-
+    c = _core_inference(url)
     return {
-        "url": url,
+        "url": c["final_url"],
         "blend": {
-            "final_prediction": label(score_final),
-            "final_score":      score_final,
+            "final_prediction": label(c["score_final"]),
+            "final_score":      c["score_final"],
         },
         "split_a": {
-            "score":      round(score_xgb, 4),
-            "prediction": label(score_xgb),
+            "score":      round(c["score_xgb"],  4),
+            "prediction": label(c["score_xgb"]),
         },
         "split_b": {
-            "score":      round(score_bert, 4),
-            "prediction": label(score_bert),
+            "score":      round(c["score_bert"], 4),
+            "prediction": label(c["score_bert"]),
         },
         "url_risk": {
-            "score":   url_score,
-            "signals": url_signals,
+            "score":   c["url_score"],
+            "signals": c["url_signals"],
         },
-        "override": override_reason or None,
-        "shap":     shap_data,
+        "shap": c["shap_data"],
     }
 
 
@@ -324,8 +261,89 @@ def scan():
     url  = data.get("url", "").strip()
     if not url:
         return jsonify({"error": "Missing 'url' field"}), 400
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
     try:
         return jsonify(run_inference(url))
+    except FileNotFoundError as e:
+        return jsonify({"error": str(e)}), 503
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+def run_pipeline_inference(url: str) -> dict:
+    """Full inference pipeline returning every intermediate value for visualisation."""
+    original_url = url
+    c = _core_inference(url)
+
+    try:
+        soup_title = BeautifulSoup(c["html_text"][:20_000], "html.parser")
+        title_tag  = soup_title.find("title")
+        page_title = title_tag.get_text(strip=True)[:120] if title_tag else ""
+    except Exception:
+        page_title = ""
+
+    redirected   = c["final_url"].rstrip("/") != original_url.rstrip("/")
+    all_features = {k: round(float(v), 4) for k, v in c["df_num"].iloc[0].to_dict().items()}
+
+    return {
+        "url": c["final_url"],
+        "stages": {
+            "url_analysis": {
+                "original_url": original_url,
+                "final_url":    c["final_url"],
+                "redirected":   redirected,
+                "score":        c["url_score"],
+                "signals":      c["url_signals"],
+            },
+            "fetch": {
+                "html_bytes": len(c["html_text"]),
+                "title":      page_title,
+            },
+            "html_features": {
+                "features": all_features,
+            },
+            "text_extraction": {
+                "visible_text":        (c["vis"][0]          if c["vis"]          else "")[:1500],
+                "visible_text_len":    len(c["vis"][0])      if c["vis"]          else 0,
+                "structural_core":     (c["struct_cores"][0] if c["struct_cores"] else "")[:1500],
+                "structural_core_len": len(c["struct_cores"][0]) if c["struct_cores"] else 0,
+            },
+            "embedding": {
+                "raw_dims": int(c["emb_bert"].shape[1]),
+                "pca_dims": int(c["emb_bert_reduced"].shape[1]),
+            },
+            "voter_a": {
+                "score":      round(c["score_xgb"], 4),
+                "prediction": label(c["score_xgb"]),
+                "shap_top":   c["shap_data"]["numeric_top"] if c["shap_data"] else [],
+            },
+            "voter_b": {
+                "score":      round(c["score_bert"], 4),
+                "prediction": label(c["score_bert"]),
+            },
+            "meta": {
+                "inputs":             [round(c["score_xgb"], 4), round(c["score_bert"], 4)],
+                "lr_weights":         [round(float(coef), 4) for coef in c["bundle"]["meta_lr"].coef_[0]],
+                "lr_intercept":       round(float(c["bundle"]["meta_lr"].intercept_[0]), 4),
+                "calibrated_score":   c["score_final"],
+                "prediction":         label(c["score_final"]),
+                "shap_contributions": c["shap_data"]["meta_contributions"] if c["shap_data"] else [],
+            },
+        },
+    }
+
+
+@app.route("/api/pipeline", methods=["POST"])
+def pipeline():
+    data = request.get_json(force=True) or {}
+    url  = data.get("url", "").strip()
+    if not url:
+        return jsonify({"error": "Missing 'url' field"}), 400
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    try:
+        return jsonify(run_pipeline_inference(url))
     except FileNotFoundError as e:
         return jsonify({"error": str(e)}), 503
     except Exception as e:

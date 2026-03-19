@@ -2,29 +2,64 @@
   "n_files": 10296,
   "n_phishing": 4207,
   "n_benign": 6089,
-  "auc_xgb_numeric": 0.9832,
-  "auc_bert": 0.9886,
-  "auc_meta": 0.9905,
-  "params_numeric": {
+  "decision_threshold": 0.5,
+  "voter_a_numeric": {
+    "roc_auc": 0.9766,
+    "pr_auc": 0.9677,
+    "precision": 0.9157,
+    "recall": 0.8901,
+    "f1": 0.9027,
+    "tp": 956,
+    "fp": 88,
+    "fn": 118,
+    "tn": 1771
+  },
+  "voter_b_lr_bert": {
+    "roc_auc": 0.9707,
+    "pr_auc": 0.9567,
+    "precision": 0.8497,
+    "recall": 0.9162,
+    "f1": 0.8817,
+    "tp": 984,
+    "fp": 174,
+    "fn": 90,
+    "tn": 1685
+  },
+  "meta_calibrated": {
+    "roc_auc": 0.9842,
+    "pr_auc": 0.9774,
+    "precision": 0.9055,
+    "recall": 0.9367,
+    "f1": 0.9208,
+    "tp": 1006,
+    "fp": 105,
+    "fn": 68,
+    "tn": 1754
+  },
+  "meta_oof_auc": 0.9869,
+  "meta_loo_auc": 0.9864,
+  "meta_val_auc": 0.9774,
+  "cal_val_auc": 0.9774,
+  "cal_loo_auc": 0.9754,
+  "generalisation_gap_val_test": -0.0068,
+  "params_voter_a": {
     "max_depth": 4,
     "learning_rate": 0.05,
     "subsample": 0.8,
     "colsample_bytree": 0.8,
-    "min_child_weight": 1,
-    "gamma": 0.1,
-    "reg_alpha": 1.0,
-    "reg_lambda": 1.0
-  },
-  "params_bert": {
-    "max_depth": 4,
-    "learning_rate": 0.05,
-    "subsample": 0.7,
-    "colsample_bytree": 0.7,
     "min_child_weight": 5,
     "gamma": 0.3,
-    "reg_alpha": 1.0,
-    "reg_lambda": 1.0
+    "reg_alpha": 0.1,
+    "reg_lambda": 2.0
   },
+  "n_trees_voter_a": 498,
+  "lr_best_C": 10.0,
+  "pca_n_components": 128,
+  "pca_variance_retained": 0.9192,
+  "meta_lr_coef": [
+    4.980517274331691,
+    3.6356295455849206
+  ],
   "numeric_columns": [
     "raw_len",
     "shannon_entropy",
@@ -42,8 +77,6 @@
     "max_dom_depth",
     "visible_len",
     "count_external_links",
-    "count_internal_links",
-    "count_unique_link_domains",
-    "ratio_external_links"
+    "count_internal_links"
   ]
 }
