@@ -17,8 +17,8 @@ Inference pipeline (mirrors train.py preprocessing exactly):
                                     → StandardScaler        [bundle["scaler"]]
                                     → Voter A XGBoost       → P_xgb
       → XLM-RoBERTa (vis + struct)  → embeddings (1536-dim)
-                                    → PCA(128)              [bundle["pca"]]
-                                    → Voter B LogisticReg   → P_lr
+                                    → UMAP(128)             [bundle["umap"]]
+                                    → Voter B XGBoost       → P_xgb_b
       → [P_xgb, P_lr]               → Meta LogisticRegression + Platt calibration
                                     → final score
 """
@@ -181,10 +181,10 @@ def _core_inference(url: str) -> dict:
 
     # ── 6. Stacking inference ──────────────────────────────────────────────────
     Xn_scaled        = bundle["scaler"].transform(Xn_raw).astype(np.float32)
-    emb_bert_reduced = bundle["pca"].transform(emb_bert).astype(np.float32)
+    emb_bert_reduced = bundle["umap"].transform(emb_bert).astype(np.float32)
 
     score_xgb  = float(bundle["xgb_numeric"].predict_proba(Xn_scaled)[0, 1])
-    score_bert = float(bundle["lr_bert"].predict_proba(emb_bert_reduced)[0, 1])
+    score_bert = float(bundle["xgb_bert"].predict_proba(emb_bert_reduced)[0, 1])
     meta_input = np.array([[score_xgb, score_bert]], dtype=np.float32)
 
     raw_meta_p  = bundle["meta_lr"].predict_proba(meta_input)[:, 1].reshape(-1, 1)
@@ -311,7 +311,7 @@ def run_pipeline_inference(url: str) -> dict:
             },
             "embedding": {
                 "raw_dims": int(c["emb_bert"].shape[1]),
-                "pca_dims": int(c["emb_bert_reduced"].shape[1]),
+                "umap_dims": int(c["emb_bert_reduced"].shape[1]),
             },
             "voter_a": {
                 "score":      round(c["score_xgb"], 4),
