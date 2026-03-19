@@ -17,8 +17,8 @@ import joblib
 import numpy as np
 import xgboost as xgb
 
-from sklearn.decomposition import PCA
-from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
+import umap
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     roc_auc_score,
     average_precision_score,
@@ -37,6 +37,7 @@ from model import HTMLFeatureExtractor, embed_texts, get_transformer
 RANDOM_SEED = 42
 ARTIFACTS_DIR = Path(__file__).parent / "artifacts"
 EMB_CACHE = ARTIFACTS_DIR / "emb_cache.npz"
+UMAP_CACHE = ARTIFACTS_DIR / "umap_cache.npz"
 MINHASH_CACHE = ARTIFACTS_DIR / "minhash_cache.pkl"
 _MINHASH_NUM_PERM = 128
 
@@ -57,7 +58,6 @@ PARAM_GRID_NUMERIC = {
     "reg_lambda": [2.0, 5.0, 10.0],
 }
 
-LR_C_GRID = [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]
 
 DECISION_THRESHOLD = 0.50
 
@@ -232,7 +232,7 @@ def _oof_fold_worker(
     Xb_tr,
     y_tr,
     params_a,
-    best_C_b,
+    params_b,
     fold_spw,
     xgb_nthread,
 ):
@@ -252,15 +252,21 @@ def _oof_fold_worker(
         verbose=False,
     )
 
-    tmp_b = LogisticRegression(
-        C=best_C_b,
-        l1_ratio=0,
-        solver="lbfgs",
-        max_iter=2000,
-        class_weight="balanced",
+    tmp_b = xgb.XGBClassifier(
+        **params_b,
+        n_estimators=N_ESTIMATORS_MAX,
+        early_stopping_rounds=EARLY_STOPPING_ROUNDS,
+        eval_metric="logloss",
+        scale_pos_weight=fold_spw,
+        nthread=xgb_nthread,
         random_state=RANDOM_SEED,
     )
-    tmp_b.fit(Xb_tr[fi_sub_tr], y_tr[fi_sub_tr])
+    tmp_b.fit(
+        Xb_tr[fi_sub_tr],
+        y_tr[fi_sub_tr],
+        eval_set=[(Xb_tr[fi_sub_val], y_tr[fi_sub_val])],
+        verbose=False,
+    )
 
     p_a = tmp_a.predict_proba(Xn_tr[fi_val])[:, 1]
     p_b = tmp_b.predict_proba(Xb_tr[fi_val])[:, 1]
@@ -319,42 +325,6 @@ def tune_xgb(X_tr, y_tr, param_grid, label="", scale_pos_weight=1.0):
     return best_model, best_params, best_n_trees
 
 
-def tune_lr(X_tr, y_tr, X_val, y_val, label=""):
-    print(
-        f"[train] {label}: fitting LogisticRegressionCV "
-        f"({len(LR_C_GRID)} C values × 5-fold, n_jobs=-1, scoring=roc_auc)…"
-    )
-
-    cv_lr = LogisticRegressionCV(
-        Cs=LR_C_GRID,
-        cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_SEED),
-        l1_ratios=(0,),
-        solver="lbfgs",
-        max_iter=2000,
-        class_weight="balanced",
-        scoring="roc_auc",
-        n_jobs=-1,
-        random_state=RANDOM_SEED,
-        refit=True,
-        use_legacy_attributes=False,
-    )
-    cv_lr.fit(X_tr, y_tr)
-
-    best_C = float(cv_lr.C_)
-    cv_scores = np.mean(cv_lr.scores_, axis=0)
-    best_cv_auc = float(cv_scores.max())
-    print(f"[train] {label} best CV AUC={best_cv_auc:.4f}  C={best_C}")
-
-    train_auc = roc_auc_score(y_tr, cv_lr.predict_proba(X_tr)[:, 1])
-    val_auc = roc_auc_score(y_val, cv_lr.predict_proba(X_val)[:, 1])
-    gap = train_auc - val_auc
-    print(
-        f"[train] {label} train AUC={train_auc:.4f}  val AUC={val_auc:.4f}  "
-        f"gap={gap:.4f}" + (" ⚠ overfit risk" if gap > 0.03 else " ✓")
-    )
-
-    return cv_lr, best_C
-
 
 def main(training_root, fast=False):
     ARTIFACTS_DIR.mkdir(exist_ok=True)
@@ -366,46 +336,63 @@ def main(training_root, fast=False):
         f"{sum(labels)} phishing, {sum(1 for lbl in labels if lbl == 0)} benign"
     )
 
-    print("[train] Reading HTML files…")
-    raw = joblib.Parallel(n_jobs=-1, backend="threading")(
-        joblib.delayed(read_file)(p) for p in tqdm(paths, desc="Reading")
-    )
-
-    paths, labels, raw, group_ids = assign_groups(
-        paths, labels, raw, sim_threshold=0.98
-    )
-    y = np.array(labels)
-    print(
-        f"[train] Dataset: {len(y)} files — {y.sum()} phishing, {(y == 0).sum()} benign"
-    )
-
-    print("[train] Extracting HTML features…")
-    extractor = HTMLFeatureExtractor()
-    df_num, extras = extractor.transform(raw)
-    vis = extras["visible_texts"]
-    struct_cores = extras["struct_cores"]
-    numeric_cols = list(df_num.columns)
-    Xn_all = df_num[numeric_cols].fillna(0).values.astype(np.float32)
-    print(f"[train] {len(numeric_cols)} numeric features extracted")
-
+    # ── Feature cache (HTML features + embeddings + group ids) ────────────────
+    feat_cache_valid = False
     if fast and EMB_CACHE.exists():
-        print("[train] Loading cached embeddings (--fast, skipping RoBERTa)…")
         cache = np.load(EMB_CACHE, allow_pickle=True)
         cached_version = str(cache.get("version", np.array("unknown")))
         if cached_version != PREPROCESSING_VERSION:
             print(
-                f"[train] ERROR: Cached embeddings built with '{cached_version}', "
+                f"[train] ERROR: Feature cache built with '{cached_version}', "
                 f"current requires '{PREPROCESSING_VERSION}'.\n"
                 f"        Delete {EMB_CACHE} and re-run without --fast."
             )
             sys.exit(1)
-        emb_bert = cache["emb_bert"]
-        assert len(emb_bert) == len(y), (
-            f"Embedding cache has {len(emb_bert)} rows but dataset has {len(y)}. "
-            "Delete artifacts/emb_cache.npz and re-run without --fast."
+        if all(k in cache for k in ("emb_bert", "Xn_all", "numeric_cols", "group_ids")):
+            n_cached = len(cache["emb_bert"])
+            if n_cached == len(paths):
+                print("[train] Loading full feature cache (--fast, skipping HTML read/extract/embed)…")
+                emb_bert    = cache["emb_bert"]
+                Xn_all      = cache["Xn_all"]
+                numeric_cols = [str(c) for c in cache["numeric_cols"]]
+                group_ids   = cache["group_ids"]
+                y           = np.array(labels)
+                feat_cache_valid = True
+                print(
+                    f"[train] Cache loaded — {emb_bert.shape[0]} samples, "
+                    f"{len(numeric_cols)} numeric features, {emb_bert.shape[1]}-dim embeddings"
+                )
+            else:
+                print(
+                    f"[train] Feature cache has {n_cached} rows but dataset has {len(paths)}. "
+                    "Rebuilding…"
+                )
+        else:
+            print("[train] Feature cache missing numeric/group fields — rebuilding…")
+
+    if not feat_cache_valid:
+        print("[train] Reading HTML files…")
+        raw = joblib.Parallel(n_jobs=-1, backend="threading")(
+            joblib.delayed(read_file)(p) for p in tqdm(paths, desc="Reading")
         )
-        print(f"[train] Embeddings loaded — {emb_bert.shape}")
-    else:
+
+        paths, labels, raw, group_ids = assign_groups(
+            paths, labels, raw, sim_threshold=0.98
+        )
+        y = np.array(labels)
+        print(
+            f"[train] Dataset: {len(y)} files — {y.sum()} phishing, {(y == 0).sum()} benign"
+        )
+
+        print("[train] Extracting HTML features…")
+        extractor = HTMLFeatureExtractor()
+        df_num, extras = extractor.transform(raw)
+        vis = extras["visible_texts"]
+        struct_cores = extras["struct_cores"]
+        numeric_cols = list(df_num.columns)
+        Xn_all = df_num[numeric_cols].fillna(0).values.astype(np.float32)
+        print(f"[train] {len(numeric_cols)} numeric features extracted")
+
         tokenizer, transformer, device = get_transformer()
         print("[train] Embedding visible text + structural core…")
         n = len(vis)
@@ -414,10 +401,15 @@ def main(training_root, fast=False):
         )
         emb_bert = np.hstack([all_embs[:n], all_embs[n:]]).astype(np.float32)
         np.savez_compressed(
-            EMB_CACHE, emb_bert=emb_bert, version=np.array(PREPROCESSING_VERSION)
+            EMB_CACHE,
+            emb_bert=emb_bert,
+            Xn_all=Xn_all,
+            numeric_cols=np.array(numeric_cols),
+            group_ids=group_ids,
+            version=np.array(PREPROCESSING_VERSION),
         )
         print(
-            f"[train] Embeddings cached → {EMB_CACHE}  "
+            f"[train] Feature cache saved → {EMB_CACHE}  "
             f"[preprocessing={PREPROCESSING_VERSION}]"
         )
 
@@ -462,15 +454,39 @@ def main(training_root, fast=False):
     Xn_val = scaler.transform(Xn_val_raw).astype(np.float32)
     Xn_te = scaler.transform(Xn_te_raw).astype(np.float32)
 
-    print("[train] Fitting PCA(n_components=128) on BERT training embeddings…")
-    pca = PCA(n_components=128, random_state=RANDOM_SEED)
-    Xb_tr = pca.fit_transform(Xb_tr_raw).astype(np.float32)
-    Xb_val = pca.transform(Xb_val_raw).astype(np.float32)
-    Xb_te = pca.transform(Xb_te_raw).astype(np.float32)
-    var_retained = float(pca.explained_variance_ratio_.sum())
-    print(
-        f"[train] PCA: {emb_bert.shape[1]} → 128 dims ({var_retained:.3%} variance retained)"
-    )
+    # ── UMAP cache ────────────────────────────────────────────────────────────
+    umap_cache_valid = False
+    if fast and UMAP_CACHE.exists():
+        uc = np.load(UMAP_CACHE, allow_pickle=True)
+        if (
+            all(k in uc for k in ("Xb_tr", "Xb_val", "Xb_te", "tr_idx", "val_idx", "te_idx"))
+            and len(uc["tr_idx"]) == len(tr_idx)
+            and np.array_equal(uc["tr_idx"], tr_idx)
+        ):
+            print("[train] Loading cached UMAP embeddings (--fast, skipping UMAP)…")
+            Xb_tr = uc["Xb_tr"]
+            Xb_val = uc["Xb_val"]
+            Xb_te = uc["Xb_te"]
+            umap_reducer = joblib.load(ARTIFACTS_DIR / "umap_model.joblib")
+            umap_cache_valid = True
+            print(f"[train] UMAP cache loaded — {Xb_tr.shape[1]} dims")
+        else:
+            print("[train] UMAP cache split mismatch — recomputing…")
+
+    if not umap_cache_valid:
+        print("[train] Fitting UMAP(n_components=128) on BERT training embeddings…")
+        umap_reducer = umap.UMAP(n_components=128, random_state=RANDOM_SEED)
+        Xb_tr = umap_reducer.fit_transform(Xb_tr_raw).astype(np.float32)
+        Xb_val = umap_reducer.transform(Xb_val_raw).astype(np.float32)
+        Xb_te = umap_reducer.transform(Xb_te_raw).astype(np.float32)
+        np.savez_compressed(
+            UMAP_CACHE,
+            Xb_tr=Xb_tr, Xb_val=Xb_val, Xb_te=Xb_te,
+            tr_idx=tr_idx, val_idx=val_idx, te_idx=te_idx,
+        )
+        joblib.dump(umap_reducer, ARTIFACTS_DIR / "umap_model.joblib")
+        print(f"[train] UMAP cache saved → {UMAP_CACHE}")
+    print(f"[train] UMAP: {emb_bert.shape[1]} → 128 dims")
 
     print("[train] Tuning Voter A — XGBoost on scaled numeric features…")
     xgb_a, params_a, n_trees_a = tune_xgb(
@@ -481,13 +497,13 @@ def main(training_root, fast=False):
         scale_pos_weight=spw,
     )
 
-    print("[train] Tuning Voter B — LogisticRegression(L2) on PCA embeddings…")
-    lr_b, best_C_b = tune_lr(
+    print("[train] Tuning Voter B — XGBoost on UMAP embeddings…")
+    xgb_b, params_b, n_trees_b = tune_xgb(
         Xb_tr,
         y_tr,
-        Xb_val,
-        y_val,
-        label="Voter B (LR-BERT)",
+        PARAM_GRID_NUMERIC,
+        "Voter B (XGB-BERT)",
+        scale_pos_weight=spw,
     )
 
     print("[train] Generating out-of-fold predictions for meta-learner…")
@@ -527,7 +543,7 @@ def main(training_root, fast=False):
             Xb_tr,
             y_tr,
             params_a,
-            best_C_b,
+            params_b,
             fold_spw,
             xgb_nthread,
         )
@@ -548,7 +564,7 @@ def main(training_root, fast=False):
     val_meta = np.column_stack(
         [
             xgb_a.predict_proba(Xn_val)[:, 1],
-            lr_b.predict_proba(Xb_val)[:, 1],
+            xgb_b.predict_proba(Xb_val)[:, 1],
         ]
     ).astype(np.float32)
 
@@ -620,7 +636,7 @@ def main(training_root, fast=False):
     )
 
     te_a = xgb_a.predict_proba(Xn_te)[:, 1]
-    te_b = lr_b.predict_proba(Xb_te)[:, 1]
+    te_b = xgb_b.predict_proba(Xb_te)[:, 1]
     meta_te = np.column_stack([te_a, te_b]).astype(np.float32)
 
     _raw_te = meta_lr.predict_proba(meta_te)[:, 1].reshape(-1, 1)
@@ -634,7 +650,7 @@ def main(training_root, fast=False):
     print(f"[train] Final Test Results  (n={len(y_te)}, threshold={DECISION_THRESHOLD})")
     print(f"[train] ══════════════════════════════════════════════════════")
     stats_a    = _model_stats("Voter A — XGBoost (numeric features)", y_te, te_a)
-    stats_b    = _model_stats("Voter B — LR-BERT (PCA embeddings)",   y_te, te_b)
+    stats_b    = _model_stats("Voter B — XGB-BERT (UMAP embeddings)",   y_te, te_b)
     stats_meta = _model_stats("Meta blend (Platt-calibrated)",        y_te, y_proba_final)
     print(
         f"\n[train]   Val AUC (calibrated):              {cal_val_auc:.4f}"
@@ -648,18 +664,19 @@ def main(training_root, fast=False):
     bundle = {
         # ── Base voters ───────────────────────────────────────────────────────
         "xgb_numeric": xgb_a,  # Voter A: XGBoost on scaled numerics
-        "lr_bert": lr_b,  # Voter B: LogisticRegression on PCA embeddings
+        "xgb_bert": xgb_b,  # Voter B: XGBoost on UMAP embeddings
         # ── Meta layer ────────────────────────────────────────────────────────
         "meta_lr": meta_lr,  # LR meta-learner fit on OOF
         "meta_calibrator": meta_calibrator,  # Platt scaler fit on val
         # ── Preprocessing transforms (fit on train only) ──────────────────────
         "scaler": scaler,
-        "pca": pca,
+        "umap": umap_reducer,
         # ── Metadata ─────────────────────────────────────────────────────────
         "numeric_columns": numeric_cols,
         "transformer_name": "xlm-roberta-base",
-        "pca_n_components": 128,
-        "lr_best_C": best_C_b,
+        "umap_n_components": 128,
+        "params_voter_b": params_b,
+        "n_trees_voter_b": n_trees_b,
         "meta_lr_coef": lr_meta_coef,
     }
     joblib.dump(bundle, model_path)
@@ -671,7 +688,7 @@ def main(training_root, fast=False):
         "n_benign": int((y == 0).sum()),
         "decision_threshold": DECISION_THRESHOLD,
         "voter_a_numeric":   stats_a,
-        "voter_b_lr_bert":   stats_b,
+        "voter_b_xgb_bert":  stats_b,
         "meta_calibrated":   stats_meta,
         "meta_oof_auc":      round(float(meta_oof_auc), 4),
         "meta_loo_auc":      round(float(meta_loo_auc), 4),
@@ -681,9 +698,9 @@ def main(training_root, fast=False):
         "generalisation_gap_val_test": round(float(gap_final), 4),
         "params_voter_a": params_a,
         "n_trees_voter_a": n_trees_a,
-        "lr_best_C": best_C_b,
-        "pca_n_components": 128,
-        "pca_variance_retained": round(var_retained, 4),
+        "params_voter_b": params_b,
+        "n_trees_voter_b": n_trees_b,
+        "umap_n_components": 128,
         "meta_lr_coef": lr_meta_coef,
         "numeric_columns": numeric_cols,
     }
