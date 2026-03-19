@@ -42,3 +42,7 @@ frontend/out/
 .idea/
 *.swp
 *.swo
+
+# ── Auto-generated markdown exports ──────────────────────────────────────────
+README.html
+README_files/
