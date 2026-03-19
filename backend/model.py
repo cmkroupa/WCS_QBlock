@@ -663,7 +663,7 @@ class PhishBERTClassifier:
     Architecture
     ────────────
       backbone  : xlm-roberta-base (bottom layers frozen)
-      pooling   : mean-pool of last hidden state (attention-masked)
+      pooling   : [CLS] token from last hidden state (position 0)
       head      : Dropout(p) → Linear(hidden_size, 1)
       loss      : BCEWithLogitsLoss with pos_weight for class imbalance
 
@@ -743,10 +743,8 @@ class PhishBERTClassifier:
 
             def forward(self_, input_ids, attention_mask):
                 out    = self_.backbone(input_ids=input_ids, attention_mask=attention_mask)
-                last   = out.last_hidden_state                     # (B, T, H)
-                m      = attention_mask.unsqueeze(-1).expand(last.size()).float()
-                pooled = (last * m).sum(1) / m.sum(1).clamp(min=1e-9)  # (B, H)
-                return self_.head(self_.dropout(pooled)).squeeze(-1)    # (B,) logits
+                cls    = out.last_hidden_state[:, 0, :]            # (B, H) — [CLS] token
+                return self_.head(self_.dropout(cls)).squeeze(-1)  # (B,) logits
 
         model = _Model(backbone, self.dropout, hidden_size)
         return tokenizer, model
