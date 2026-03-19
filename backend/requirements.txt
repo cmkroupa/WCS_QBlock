@@ -13,5 +13,4 @@ joblib
 tqdm
 datasketch
 shap
-umap-learn
 playwright

@@ -14,12 +14,11 @@ Start:
 Inference pipeline (mirrors train.py preprocessing exactly):
     raw HTML
       → HTMLFeatureExtractor   → numeric features
-                                    → StandardScaler        [bundle["scaler"]]
-                                    → Voter A XGBoost       → P_xgb
-      → XLM-RoBERTa (vis + struct)  → embeddings (1536-dim)
-                                    → UMAP(128)             [bundle["umap"]]
-                                    → Voter B XGBoost       → P_xgb_b
-      → [P_xgb, P_lr]               → Meta LogisticRegression + Platt calibration
+                                    → StandardScaler           [bundle["scaler"]]
+                                    → Voter A XGBoost          → P_xgb
+      → combine_texts(vis, struct)   → PhishBERTClassifier     → P_bert
+                                       (fine-tuned RoBERTa + linear head)
+      → [P_xgb, P_bert]             → Meta LogisticRegression + Platt calibration
                                     → final score
 """
 
@@ -37,19 +36,18 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 from helpers import fetch_html, label
-from model import HTMLFeatureExtractor, embed_texts, get_transformer, url_risk_score
+from model import HTMLFeatureExtractor, url_risk_score, combine_texts, PhishBERTClassifier
 
-ARTIFACTS_DIR = Path(__file__).parent / "artifacts"
-MODEL_PATH    = ARTIFACTS_DIR / "model.joblib"
+ARTIFACTS_DIR  = Path(__file__).parent / "artifacts"
+MODEL_PATH     = ARTIFACTS_DIR / "model.joblib"
+BERT_CLF_PATH  = ARTIFACTS_DIR / "bert_classifier.pt"
 
 app = Flask(__name__)
 CORS(app)
 
 # ── Lazy-loaded globals ───────────────────────────────────────────────────────
 _bundle            = None
-_tokenizer         = None
-_transformer       = None
-_device            = None
+_bert_clf          = None   # PhishBERTClassifier (Voter B)
 _explainer_numeric = None   # shap.TreeExplainer for Voter A (XGBoost)
 
 
@@ -67,11 +65,18 @@ def load_model():
     return _bundle
 
 
-def load_transformer():
-    global _tokenizer, _transformer, _device
-    if _tokenizer is None:
-        _tokenizer, _transformer, _device = get_transformer()
-    return _tokenizer, _transformer, _device
+def load_bert_clf():
+    global _bert_clf
+    if _bert_clf is None:
+        path = Path(load_model().get("bert_clf_path", str(BERT_CLF_PATH)))
+        if not path.exists():
+            raise FileNotFoundError(
+                f"PhishBERT model not found at {path}. Re-run train.py."
+            )
+        print(f"[app] Loading PhishBERT classifier from {path}…")
+        _bert_clf = PhishBERTClassifier.load(path)
+        print("[app] PhishBERT ready.")
+    return _bert_clf
 
 
 def get_explainers():
@@ -136,7 +141,7 @@ def compute_shap(Xn_raw, Xn_scaled, numeric_cols, meta_input):
 
     meta_shap_names = [
         "XGBoost (HTML numeric features)",
-        "LogisticRegression (BERT embeddings)",
+        "PhishBERT (fine-tuned RoBERTa)",
     ]
     meta_contribs = [
         {
@@ -169,22 +174,18 @@ def _core_inference(url: str) -> dict:
     vis          = extras["visible_texts"]
     struct_cores = extras["struct_cores"]
 
-    # ── 4. Embed with XLM-RoBERTa (single pass for both channels) ─────────────
-    tok, trans, dev = load_transformer()
-    all_embs = embed_texts(tok, trans, dev, vis + struct_cores, desc="embedding")
-    emb_bert = np.hstack([all_embs[:1], all_embs[1:]]).astype(np.float32)  # (1, 1536)
-
-    # ── 5. Load model bundle ───────────────────────────────────────────────────
+    # ── 4. Load model bundle + PhishBERT ──────────────────────────────────────
     bundle       = load_model()
+    bert_clf     = load_bert_clf()
     numeric_cols = bundle["numeric_columns"]
     Xn_raw       = df_num[numeric_cols].fillna(0).values.astype(np.float32)
 
-    # ── 6. Stacking inference ──────────────────────────────────────────────────
-    Xn_scaled        = bundle["scaler"].transform(Xn_raw).astype(np.float32)
-    emb_bert_reduced = bundle["umap"].transform(emb_bert).astype(np.float32)
-
+    # ── 5. Stacking inference ──────────────────────────────────────────────────
+    Xn_scaled  = bundle["scaler"].transform(Xn_raw).astype(np.float32)
     score_xgb  = float(bundle["xgb_numeric"].predict_proba(Xn_scaled)[0, 1])
-    score_bert = float(bundle["xgb_bert"].predict_proba(emb_bert_reduced)[0, 1])
+
+    combined_text = combine_texts(vis[0] if vis else "", struct_cores[0] if struct_cores else "")
+    score_bert    = float(bert_clf.predict_proba([combined_text])[0, 1])
     meta_input = np.array([[score_xgb, score_bert]], dtype=np.float32)
 
     raw_meta_p  = bundle["meta_lr"].predict_proba(meta_input)[:, 1].reshape(-1, 1)
@@ -199,24 +200,23 @@ def _core_inference(url: str) -> dict:
             print(f"[app] SHAP skipped: {e}")
 
     return {
-        "html_text":        html_text,
-        "final_url":        final_url,
-        "url_score":        url_score,
-        "url_signals":      url_signals,
-        "df_num":           df_num,
-        "vis":              vis,
-        "struct_cores":     struct_cores,
-        "emb_bert":         emb_bert,
-        "emb_bert_reduced": emb_bert_reduced,
-        "bundle":           bundle,
-        "numeric_cols":     numeric_cols,
-        "Xn_raw":           Xn_raw,
-        "Xn_scaled":        Xn_scaled,
-        "score_xgb":        score_xgb,
-        "score_bert":       score_bert,
-        "meta_input":       meta_input,
-        "score_final":      score_final,
-        "shap_data":        shap_data,
+        "html_text":      html_text,
+        "final_url":      final_url,
+        "url_score":      url_score,
+        "url_signals":    url_signals,
+        "df_num":         df_num,
+        "vis":            vis,
+        "struct_cores":   struct_cores,
+        "combined_text":  combined_text,
+        "bundle":         bundle,
+        "numeric_cols":   numeric_cols,
+        "Xn_raw":         Xn_raw,
+        "Xn_scaled":      Xn_scaled,
+        "score_xgb":      score_xgb,
+        "score_bert":     score_bert,
+        "meta_input":     meta_input,
+        "score_final":    score_final,
+        "shap_data":      shap_data,
     }
 
 
@@ -310,8 +310,8 @@ def run_pipeline_inference(url: str) -> dict:
                 "structural_core_len": len(c["struct_cores"][0]) if c["struct_cores"] else 0,
             },
             "embedding": {
-                "raw_dims": int(c["emb_bert"].shape[1]),
-                "umap_dims": int(c["emb_bert_reduced"].shape[1]),
+                "voter_b_model": "PhishBERTClassifier (xlm-roberta-base + head)",
+                "bert_input_len": len(c["combined_text"]),
             },
             "voter_a": {
                 "score":      round(c["score_xgb"], 4),

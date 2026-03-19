@@ -626,6 +626,306 @@ def _process_single_html(html_text: str) -> tuple:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PhishBERT — fine-tuned RoBERTa classification head (Voter B)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def combine_texts(vis_text: str, struct_core: str) -> str:
+    """Concatenate visible text + structural fingerprint for classifier input."""
+    parts = [p.strip() for p in (vis_text, struct_core) if p and p.strip()]
+    return " ".join(parts)
+
+
+class _PhishBERTDataset:
+    """Minimal PyTorch-compatible dataset for tokenised phishing classification."""
+
+    def __init__(self, input_ids, attention_masks, labels=None):
+        self.input_ids       = input_ids
+        self.attention_masks = attention_masks
+        self.labels          = labels
+
+    def __len__(self):
+        return len(self.input_ids)
+
+    def __getitem__(self, idx):
+        item = {
+            "input_ids":      self.input_ids[idx],
+            "attention_mask": self.attention_masks[idx],
+        }
+        if self.labels is not None:
+            item["labels"] = self.labels[idx]
+        return item
+
+
+class PhishBERTClassifier:
+    """
+    XLM-RoBERTa + linear classification head, fine-tuned for phishing detection.
+
+    Architecture
+    ────────────
+      backbone  : xlm-roberta-base (bottom layers frozen)
+      pooling   : mean-pool of last hidden state (attention-masked)
+      head      : Dropout(p) → Linear(hidden_size, 1)
+      loss      : BCEWithLogitsLoss with pos_weight for class imbalance
+
+    Training modes (n_unfreeze_layers)
+    ────────────────────────────────────
+      0  — head only  (frozen backbone, ~seconds per epoch — used for OOF proxy)
+      2  — fine-tune top-2 transformer blocks + head  (default)
+
+    Sklearn-compatible: fit(texts, y), predict_proba(texts) → (N, 2).
+    Input texts should be combine_texts(vis_text, struct_core).
+    """
+
+    def __init__(
+        self,
+        model_name=TRANSFORMER_NAME,
+        n_unfreeze_layers=2,
+        dropout=0.2,
+        lr=2e-5,
+        head_lr=5e-4,
+        weight_decay=0.01,
+        batch_size=16,
+        max_epochs=8,
+        patience=2,
+        warmup_ratio=0.06,
+        max_length=512,
+        device=None,
+        random_state=42,
+    ):
+        self.model_name        = model_name
+        self.n_unfreeze_layers = n_unfreeze_layers
+        self.dropout           = dropout
+        self.lr                = lr
+        self.head_lr           = head_lr
+        self.weight_decay      = weight_decay
+        self.batch_size        = batch_size
+        self.max_epochs        = max_epochs
+        self.patience          = patience
+        self.warmup_ratio      = warmup_ratio
+        self.max_length        = max_length
+        self.device            = device or get_device()
+        self.random_state      = random_state
+
+        self._model     = None
+        self._tokenizer = None
+
+    # ── Private helpers ───────────────────────────────────────────────────────
+
+    def _build(self):
+        """Construct tokeniser and model (backbone + head). Returns (tok, model)."""
+        import torch
+        import torch.nn as nn
+        from transformers import AutoTokenizer, AutoModel
+
+        tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        backbone  = AutoModel.from_pretrained(self.model_name)
+
+        # Freeze entire backbone first
+        for param in backbone.parameters():
+            param.requires_grad = False
+
+        # Selectively unfreeze top N transformer encoder layers
+        if self.n_unfreeze_layers > 0:
+            for layer in backbone.encoder.layer[-self.n_unfreeze_layers:]:
+                for param in layer.parameters():
+                    param.requires_grad = True
+
+        hidden_size = backbone.config.hidden_size  # 768 for base
+
+        class _Model(nn.Module):
+            def __init__(self_, backbone, dropout, hidden_size):
+                super().__init__()
+                self_.backbone   = backbone
+                self_.dropout    = nn.Dropout(dropout)
+                self_.head       = nn.Linear(hidden_size, 1)
+                nn.init.xavier_uniform_(self_.head.weight)
+                nn.init.zeros_(self_.head.bias)
+
+            def forward(self_, input_ids, attention_mask):
+                out    = self_.backbone(input_ids=input_ids, attention_mask=attention_mask)
+                last   = out.last_hidden_state                     # (B, T, H)
+                m      = attention_mask.unsqueeze(-1).expand(last.size()).float()
+                pooled = (last * m).sum(1) / m.sum(1).clamp(min=1e-9)  # (B, H)
+                return self_.head(self_.dropout(pooled)).squeeze(-1)    # (B,) logits
+
+        model = _Model(backbone, self.dropout, hidden_size)
+        return tokenizer, model
+
+    def _make_loader(self, texts, labels=None, shuffle=False):
+        """Tokenise texts and return a DataLoader."""
+        import torch
+        from torch.utils.data import DataLoader
+
+        enc = self._tokenizer(
+            list(texts),
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+        lbl = torch.tensor(labels, dtype=torch.float32) if labels is not None else None
+        ds  = _PhishBERTDataset(enc["input_ids"], enc["attention_mask"], lbl)
+        return DataLoader(
+            ds,
+            batch_size=self.batch_size if shuffle else self.batch_size * 2,
+            shuffle=shuffle,
+        )
+
+    def _raw_logits(self, loader):
+        """Run the model in eval mode and return concatenated logits."""
+        import torch
+        self._model.eval()
+        all_logits = []
+        with torch.no_grad():
+            for batch in loader:
+                logits = self._model(
+                    batch["input_ids"].to(self.device),
+                    batch["attention_mask"].to(self.device),
+                )
+                all_logits.append(logits.cpu())
+        return torch.cat(all_logits)
+
+    def _val_auc(self, loader, y_true):
+        from sklearn.metrics import roc_auc_score
+        import torch
+        probs = torch.sigmoid(self._raw_logits(loader)).numpy()
+        return roc_auc_score(y_true, probs)
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def fit(self, texts, y, val_texts=None, val_y=None):
+        import torch
+        import torch.nn as nn
+        from torch.optim import AdamW
+        from transformers import get_linear_schedule_with_warmup
+
+        torch.manual_seed(self.random_state)
+
+        print(
+            f"[bert] Building PhishBERT "
+            f"(unfreeze_layers={self.n_unfreeze_layers}, device={self.device})…"
+        )
+        self._tokenizer, self._model = self._build()
+        self._model = self._model.to(self.device)
+
+        print(f"[bert] Tokenising {len(texts)} training samples…")
+        train_loader = self._make_loader(texts, y, shuffle=True)
+        val_loader   = (
+            self._make_loader(val_texts, val_y) if val_texts is not None else None
+        )
+
+        # Class-imbalance weighting
+        n_neg      = int((np.array(y) == 0).sum())
+        n_pos      = int((np.array(y) == 1).sum())
+        pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32).to(self.device)
+        criterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+        # Separate learning-rate groups: higher LR for the fresh head
+        head_params     = list(self._model.head.parameters())
+        head_ids        = {id(p) for p in head_params}
+        backbone_params = [p for p in self._model.parameters()
+                           if p.requires_grad and id(p) not in head_ids]
+
+        optimizer = AdamW(
+            [
+                {"params": backbone_params, "lr": self.lr},
+                {"params": head_params,     "lr": self.head_lr},
+            ],
+            weight_decay=self.weight_decay,
+        )
+
+        total_steps   = len(train_loader) * self.max_epochs
+        warmup_steps  = int(total_steps * self.warmup_ratio)
+        scheduler     = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+
+        best_val_auc = 0.0
+        best_state   = None
+        no_improve   = 0
+
+        for epoch in range(self.max_epochs):
+            self._model.train()
+            total_loss = 0.0
+            for batch in train_loader:
+                optimizer.zero_grad()
+                logits = self._model(
+                    batch["input_ids"].to(self.device),
+                    batch["attention_mask"].to(self.device),
+                )
+                loss = criterion(logits, batch["labels"].to(self.device))
+                loss.backward()
+                nn.utils.clip_grad_norm_(self._model.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
+                total_loss += loss.item()
+
+            avg_loss = total_loss / len(train_loader)
+
+            if val_loader is not None:
+                val_auc = self._val_auc(val_loader, val_y)
+                print(
+                    f"[bert]   Epoch {epoch + 1}/{self.max_epochs}  "
+                    f"loss={avg_loss:.4f}  val_AUC={val_auc:.4f}"
+                )
+                if val_auc > best_val_auc:
+                    best_val_auc = val_auc
+                    best_state   = {k: v.cpu().clone() for k, v in self._model.state_dict().items()}
+                    no_improve   = 0
+                else:
+                    no_improve += 1
+                    if no_improve >= self.patience:
+                        print(f"[bert]   Early stopping at epoch {epoch + 1}")
+                        break
+            else:
+                print(f"[bert]   Epoch {epoch + 1}/{self.max_epochs}  loss={avg_loss:.4f}")
+
+        if best_state is not None:
+            self._model.load_state_dict(best_state)
+            print(f"[bert] Restored best checkpoint (val_AUC={best_val_auc:.4f})")
+
+        return self
+
+    def predict_proba(self, texts):
+        """Return (N, 2) array [P_benign, P_phish] — sklearn convention."""
+        import torch
+        loader = self._make_loader(texts)
+        probs  = torch.sigmoid(self._raw_logits(loader)).numpy()
+        return np.column_stack([1 - probs, probs])
+
+    def save(self, path):
+        import torch
+        torch.save(
+            {
+                "model_state": self._model.state_dict(),
+                "config": {
+                    "model_name":        self.model_name,
+                    "n_unfreeze_layers": self.n_unfreeze_layers,
+                    "dropout":           self.dropout,
+                    "max_length":        self.max_length,
+                },
+            },
+            path,
+        )
+
+    @classmethod
+    def load(cls, path, device=None):
+        import torch
+        data   = torch.load(path, map_location="cpu", weights_only=False)
+        cfg    = data["config"]
+        obj    = cls(
+            model_name=cfg["model_name"],
+            n_unfreeze_layers=cfg["n_unfreeze_layers"],
+            dropout=cfg["dropout"],
+            max_length=cfg["max_length"],
+            device=device,
+        )
+        obj._tokenizer, obj._model = obj._build()
+        obj._model.load_state_dict(data["model_state"])
+        obj._model = obj._model.to(obj.device)
+        obj._model.eval()
+        return obj
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Transformer / embedding utilities
 # ─────────────────────────────────────────────────────────────────────────────
 
