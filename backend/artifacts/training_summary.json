@@ -3,71 +3,58 @@
   "n_phishing": 4207,
   "n_benign": 6089,
   "decision_threshold": 0.5,
-  "voter_a_numeric": {
-    "roc_auc": 0.9766,
-    "pr_auc": 0.9677,
-    "precision": 0.9157,
-    "recall": 0.8901,
-    "f1": 0.9027,
-    "tp": 956,
-    "fp": 88,
-    "fn": 118,
-    "tn": 1771
+  "voter_a": {
+    "roc_auc": 0.9762,
+    "pr_auc": 0.9685,
+    "precision": 0.8897,
+    "recall": 0.9035,
+    "f1": 0.8966,
+    "tp": 702,
+    "fp": 87,
+    "fn": 75,
+    "tn": 1134
   },
-  "voter_b_xgb_bert": {
-    "roc_auc": 0.932,
-    "pr_auc": 0.8874,
-    "precision": 0.8541,
-    "recall": 0.7961,
-    "f1": 0.8241,
-    "tp": 855,
-    "fp": 146,
-    "fn": 219,
-    "tn": 1713
+  "voter_b": {
+    "roc_auc": 0.9723,
+    "pr_auc": 0.9639,
+    "precision": 0.8755,
+    "recall": 0.9048,
+    "f1": 0.8899,
+    "tp": 703,
+    "fp": 100,
+    "fn": 74,
+    "tn": 1121
   },
-  "meta_calibrated": {
-    "roc_auc": 0.9758,
-    "pr_auc": 0.964,
-    "precision": 0.9099,
-    "recall": 0.9032,
-    "f1": 0.9065,
-    "tp": 970,
-    "fp": 96,
-    "fn": 104,
-    "tn": 1763
+  "meta_lr": {
+    "roc_auc": 0.9817,
+    "pr_auc": 0.9747,
+    "precision": 0.9015,
+    "recall": 0.9305,
+    "f1": 0.9158,
+    "tp": 723,
+    "fp": 79,
+    "fn": 54,
+    "tn": 1142
   },
-  "meta_oof_auc": 0.9854,
-  "meta_loo_auc": 0.9851,
-  "meta_val_auc": 0.9661,
-  "cal_val_auc": 0.9661,
-  "cal_loo_auc": 0.9604,
-  "generalisation_gap_val_test": -0.0097,
-  "params_voter_a": {
+  "meta_val_auc": 0.9775,
+  "test_auc": 0.9817,
+  "generalisation_gap": -0.0043,
+  "xgb_params": {
     "max_depth": 4,
     "learning_rate": 0.05,
     "subsample": 0.8,
     "colsample_bytree": 0.8,
-    "min_child_weight": 5,
+    "min_child_weight": 10,
     "gamma": 0.3,
-    "reg_alpha": 0.1,
-    "reg_lambda": 2.0
+    "reg_alpha": 1.0,
+    "reg_lambda": 5.0
   },
-  "n_trees_voter_a": 498,
-  "params_voter_b": {
-    "max_depth": 4,
-    "learning_rate": 0.05,
-    "subsample": 0.8,
-    "colsample_bytree": 0.8,
-    "min_child_weight": 5,
-    "gamma": 0.3,
-    "reg_alpha": 0.1,
-    "reg_lambda": 2.0
-  },
-  "n_trees_voter_b": 378,
-  "umap_n_components": 128,
+  "xgb_n_trees": 500,
+  "voter_b_type": "PhishBERTClassifier",
+  "bert_clf_path": "/Users/camk/Desktop/QBlock/backend/artifacts/bert_classifier.pt",
   "meta_lr_coef": [
-    5.108828896716868,
-    3.3177761036694484
+    4.892658525337015,
+    2.6738264814907082
   ],
   "numeric_columns": [
     "raw_len",
@@ -86,6 +73,13 @@
     "max_dom_depth",
     "visible_len",
     "count_external_links",
-    "count_internal_links"
+    "count_internal_links",
+    "count_password_inputs",
+    "count_hidden_inputs",
+    "count_forms_post",
+    "count_meta_refresh",
+    "count_javascript_hrefs",
+    "count_data_uris",
+    "count_hidden_divs"
   ]
 }

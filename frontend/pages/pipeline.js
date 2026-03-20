@@ -175,18 +175,23 @@ export default function PipelinePage() {
     setVisibleCount(0);
     setResult(null);
     setError('');
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 90_000);
     try {
       const res = await fetch(`${API_BASE}/api/pipeline`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: u }),
+        signal: controller.signal,
       });
+      clearTimeout(timeoutId);
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Backend request failed');
       setResult(data);
       setStatus('result');
     } catch (err) {
-      setError(err.message);
+      clearTimeout(timeoutId);
+      setError(err.name === 'AbortError' ? 'Request timed out — backend took over 90s' : err.message);
       setStatus('error');
     }
   };
@@ -396,7 +401,7 @@ export default function PipelinePage() {
 
             {/* ── 5: Embedding ── */}
             {(() => {
-              const { raw_dims, pca_dims } = s.embedding;
+              const { voter_b_model, bert_input_len } = s.embedding;
               return (
                 <PlStage idx={5} title="Transformer Embedding"
                   visible={visibleCount >= 5} isLast={false}>
@@ -405,10 +410,11 @@ export default function PipelinePage() {
                     <span className="plEmbedArrow">+</span>
                     <div className="plEmbedBlock">Structural</div>
                     <span className="plEmbedArrow">→ combine →</span>
-                    <div className="plEmbedBlock ">{raw_dims} dim</div>
-                    <span className="plEmbedArrow">→ PCA →</span>
-                    <div className="plEmbedBlock ">{pca_dims} dim</div>
+                    <div className="plEmbedBlock">{bert_input_len} chars</div>
+                    <span className="plEmbedArrow">→ tokenise →</span>
+                    <div className="plEmbedBlock">[CLS] token</div>
                   </div>
+                  <p className="plMuted" style={{ marginTop: 8, fontSize: '0.8rem' }}>{voter_b_model}</p>
                 </PlStage>
               );
             })()}
@@ -456,15 +462,14 @@ export default function PipelinePage() {
             {/* ── 7: Voter B ── */}
             {(() => {
               const { score, prediction } = s.voter_b;
-              const { pca_dims } = s.embedding;
               const cls = scoreClass(prediction);
               return (
-                <PlStage idx={7} title="Voter B — Logistic Regression"
+                <PlStage idx={7} title="Voter B — PhishBERT"
                   badge={`${pct(score)}%`} badgeCls={cls}
                   visible={visibleCount >= 7} isLast={false}>
                   <div className="plVoterRow">
                     <ScoreRing score={score} />
-                    <p className="plVoterName">Trained on the {pca_dims} dim RoBERTa embeddings</p>
+                    <p className="plVoterName">Fine-tuned XLM-RoBERTa · scores page text end-to-end</p>
                   </div>
                 </PlStage>
               );

@@ -14,12 +14,12 @@ Start:
 Inference pipeline (mirrors train.py preprocessing exactly):
     raw HTML
       → HTMLFeatureExtractor   → numeric features
-                                    → StandardScaler           [bundle["scaler"]]
+                                    → StandardScaler           [voter_a_bundle["scaler"]]
                                     → Voter A XGBoost          → P_xgb
-      → combine_texts(vis, struct)   → PhishBERTClassifier     → P_bert
+      → visible text only           → PhishBERTClassifier     → P_bert
                                        (fine-tuned RoBERTa + linear head)
-      → [P_xgb, P_bert]             → Meta LogisticRegression + Platt calibration
-                                    → final score
+      → [P_xgb, P_bert]             → Meta LogisticRegression → final score
+                                       (natively calibrated — no Platt step)
 """
 
 import os
@@ -27,6 +27,21 @@ from pathlib import Path
 
 # Python 3.14 + macOS ARM64: fork() after loading torch causes SIGSEGV at shutdown.
 os.environ.setdefault("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES")
+
+# Prevent backend threading libraries from conflicting with Flask + PyTorch.
+# OMP/MKL spin up their own thread pools; on macOS ARM64 this races with
+# PyTorch's own threads and causes load_state_dict to hang indefinitely.
+os.environ["OMP_NUM_THREADS"]        = "1"
+os.environ["MKL_NUM_THREADS"]        = "1"
+os.environ["OPENBLAS_NUM_THREADS"]   = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"]    = "1"
+
+# HuggingFace fast tokenizers use a Rust/Rayon parallel thread pool internally.
+# When the tokenizer is called from Flask's worker threads that pool deadlocks,
+# causing inference to hang forever.  Disabling parallelism makes the tokenizer
+# run single-threaded, which is correct for per-request inference anyway.
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import joblib
 import numpy as np
@@ -36,10 +51,13 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 from helpers import fetch_html, label
-from model import HTMLFeatureExtractor, url_risk_score, combine_texts, PhishBERTClassifier
+from features import HTMLFeatureExtractor
+from heuristics import url_risk_score
+from phishbert import PhishBERTClassifier, combine_texts
 
 ARTIFACTS_DIR  = Path(__file__).parent / "artifacts"
 MODEL_PATH     = ARTIFACTS_DIR / "model.joblib"
+VOTER_A_PATH   = ARTIFACTS_DIR / "voter_a.joblib"
 BERT_CLF_PATH  = ARTIFACTS_DIR / "bert_classifier.pt"
 
 app = Flask(__name__)
@@ -47,6 +65,7 @@ CORS(app)
 
 # ── Lazy-loaded globals ───────────────────────────────────────────────────────
 _bundle            = None
+_voter_a_bundle    = None   # {"xgb_a", "scaler", "n_trees"} — canonical scaler source
 _bert_clf          = None   # PhishBERTClassifier (Voter B)
 _explainer_numeric = None   # shap.TreeExplainer for Voter A (XGBoost)
 
@@ -65,6 +84,24 @@ def load_model():
     return _bundle
 
 
+def load_voter_a():
+    """Load Voter A bundle — the canonical source for both xgb_numeric and scaler."""
+    global _voter_a_bundle
+    if _voter_a_bundle is None:
+        if VOTER_A_PATH.exists():
+            print(f"[app] Loading Voter A from {VOTER_A_PATH}…")
+            _voter_a_bundle = joblib.load(VOTER_A_PATH)
+        else:
+            # Fallback: pull from model.joblib for backwards compatibility
+            print("[app] voter_a.joblib not found — falling back to model.joblib scaler.")
+            bundle = load_model()
+            _voter_a_bundle = {
+                "xgb_a":  bundle["xgb_numeric"],
+                "scaler": bundle["scaler"],
+            }
+    return _voter_a_bundle
+
+
 def load_bert_clf():
     global _bert_clf
     if _bert_clf is None:
@@ -74,8 +111,11 @@ def load_bert_clf():
                 f"PhishBERT model not found at {path}. Re-run train.py."
             )
         print(f"[app] Loading PhishBERT classifier from {path}…")
-        _bert_clf = PhishBERTClassifier.load(path)
-        print("[app] PhishBERT ready.")
+        # Force CPU for inference: Flask handles requests on worker threads,
+        # and PyTorch MPS is only safe on the main thread — using MPS here
+        # causes requests to hang indefinitely.
+        _bert_clf = PhishBERTClassifier.load(path, device="cpu")
+        print("[app] PhishBERT ready (inference on CPU).")
     return _bert_clf
 
 
@@ -83,8 +123,8 @@ def get_explainers():
     """Return explainer_numeric (TreeExplainer on Voter A), built once and cached."""
     global _explainer_numeric
     if _explainer_numeric is None:
-        bundle = load_model()
-        _explainer_numeric = shap.TreeExplainer(bundle["xgb_numeric"])
+        # Use voter_a["xgb_a"] — same model object the scaler was fit alongside.
+        _explainer_numeric = shap.TreeExplainer(load_voter_a()["xgb_a"])
         print("[app] SHAP explainer ready.")
     return _explainer_numeric
 
@@ -175,48 +215,51 @@ def _core_inference(url: str) -> dict:
     struct_cores = extras["struct_cores"]
 
     # ── 4. Load model bundle + PhishBERT ──────────────────────────────────────
-    bundle       = load_model()
-    bert_clf     = load_bert_clf()
-    numeric_cols = bundle["numeric_columns"]
-    Xn_raw       = df_num[numeric_cols].fillna(0).values.astype(np.float32)
+    bundle        = load_model()
+    voter_a       = load_voter_a()   # canonical source for scaler + xgb
+    bert_clf      = load_bert_clf()
+    numeric_cols  = bundle["numeric_columns"]
+    Xn_raw        = df_num[numeric_cols].fillna(0).values.astype(np.float32)
 
     # ── 5. Stacking inference ──────────────────────────────────────────────────
-    Xn_scaled  = bundle["scaler"].transform(Xn_raw).astype(np.float32)
-    score_xgb  = float(bundle["xgb_numeric"].predict_proba(Xn_scaled)[0, 1])
+    # scaler is loaded from voter_a.joblib — the same object fit during training.
+    # Using any other scaler here would silently corrupt XGBoost predictions.
+    Xn_scaled     = voter_a["scaler"].transform(Xn_raw).astype(np.float32)
+    score_xgb     = float(voter_a["xgb_a"].predict_proba(Xn_scaled)[0, 1])
 
+    # Voter B: combine visible text + structural core, matching training input format.
     combined_text = combine_texts(vis[0] if vis else "", struct_cores[0] if struct_cores else "")
     score_bert    = float(bert_clf.predict_proba([combined_text])[0, 1])
     meta_input = np.array([[score_xgb, score_bert]], dtype=np.float32)
 
-    raw_meta_p  = bundle["meta_lr"].predict_proba(meta_input)[:, 1].reshape(-1, 1)
-    score_final = round(float(bundle["meta_calibrator"].predict_proba(raw_meta_p)[0, 1]), 4)
+    # meta_lr (LogisticRegression) is natively calibrated — no Platt step.
+    score_final = round(float(bundle["meta_lr"].predict_proba(meta_input)[0, 1]), 4)
 
     # ── 7. SHAP ────────────────────────────────────────────────────────────────
     shap_data = None
-    if "xgb_numeric" in bundle:
-        try:
-            shap_data = compute_shap(Xn_raw, Xn_scaled, numeric_cols, meta_input)
-        except Exception as e:
-            print(f"[app] SHAP skipped: {e}")
+    try:
+        shap_data = compute_shap(Xn_raw, Xn_scaled, numeric_cols, meta_input)
+    except Exception as e:
+        print(f"[app] SHAP skipped: {e}")
 
     return {
-        "html_text":      html_text,
-        "final_url":      final_url,
-        "url_score":      url_score,
-        "url_signals":    url_signals,
-        "df_num":         df_num,
-        "vis":            vis,
-        "struct_cores":   struct_cores,
-        "combined_text":  combined_text,
-        "bundle":         bundle,
-        "numeric_cols":   numeric_cols,
-        "Xn_raw":         Xn_raw,
-        "Xn_scaled":      Xn_scaled,
-        "score_xgb":      score_xgb,
-        "score_bert":     score_bert,
-        "meta_input":     meta_input,
-        "score_final":    score_final,
-        "shap_data":      shap_data,
+        "html_text":    html_text,
+        "final_url":    final_url,
+        "url_score":    url_score,
+        "url_signals":  url_signals,
+        "df_num":       df_num,
+        "vis":          vis,
+        "struct_cores": struct_cores,
+        "bundle":       bundle,
+        "numeric_cols": numeric_cols,
+        "Xn_raw":       Xn_raw,
+        "Xn_scaled":    Xn_scaled,
+        "combined_text": combined_text,
+        "score_xgb":    score_xgb,
+        "score_bert":   score_bert,
+        "meta_input":   meta_input,
+        "score_final":  score_final,
+        "shap_data":    shap_data,
     }
 
 
@@ -352,8 +395,29 @@ def pipeline():
 
 if __name__ == "__main__":
     print("[app] QBlock backend starting on http://localhost:5001")
-    try:
-        load_model()
-    except FileNotFoundError as e:
-        print(f"[app] WARNING: {e}")
-    app.run(host="0.0.0.0", port=5001, debug=False)
+    # Pre-load every model on the main thread before Flask starts its worker
+    # threads.  On macOS, PyTorch's device-detection code (even for CPU models)
+    # touches AppKit/NSRunLoop APIs that must run on the main thread — lazy
+    # loading inside a Flask worker thread deadlocks indefinitely.
+    all_loaded = True
+    for loader, name in [
+        (load_model,     "model.joblib"),
+        (load_voter_a,   "voter_a.joblib"),
+        (load_bert_clf,  "bert_classifier.pt"),
+        (get_explainers, "SHAP explainer"),
+    ]:
+        try:
+            loader()
+        except FileNotFoundError as e:
+            print(f"[app] WARNING: {name} not found — {e}")
+            all_loaded = False
+        except Exception as e:
+            print(f"[app] WARNING: could not pre-load {name}: {e}")
+            all_loaded = False
+    if all_loaded:
+        print("[app] ✓ All models ready — QBlock is up and accepting requests.")
+    else:
+        print("[app] ⚠  Some models failed to load — check warnings above.")
+    # threaded=False — Playwright requires a single-threaded environment to
+    # avoid asyncio event-loop conflicts when running inside Flask.
+    app.run(host="0.0.0.0", port=5001, debug=False, threaded=False)

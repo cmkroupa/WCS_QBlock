@@ -1,3 +1,27 @@
+"""
+train.py — QBlock phishing detector trainer (v2).
+
+Architecture
+────────────
+  Voter A : XGBoost on scaled numeric HTML features
+  Voter B : Fine-tuned RoBERTa on visible text + structural HTML core
+  Meta    : LogisticRegression on [P_xgb, P_roberta] → Platt-calibrated score
+
+Speed-ups
+─────────
+  • HTML reading              — joblib threading   (all cores, I/O bound)
+  • HTML feature extraction   — joblib processes   (all cores, CPU bound)
+  • MinHash deduplication     — persistent cache   (only new files recomputed)
+  • Feature / text cache      — npz on disk        (--fast skips entirely)
+  • PhishBERT checkpoint      — persistent .pt     (--fast reloads if split unchanged)
+  • XGBoost                   — fixed proven hyperparams + early stopping (no grid search)
+
+Usage
+─────
+  python3 train.py data/training          # full run
+  python3 train.py data/training --fast   # skip feature extraction + BERT fine-tune if cached
+"""
+
 import hashlib
 import json
 import multiprocessing
@@ -16,65 +40,77 @@ if __name__ == "__main__":
 import joblib
 import numpy as np
 import xgboost as xgb
-
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
-    roc_auc_score,
     average_precision_score,
+    confusion_matrix,
+    f1_score,
     precision_score,
     recall_score,
-    f1_score,
-    confusion_matrix,
+    roc_auc_score,
 )
-from sklearn.model_selection import GroupShuffleSplit, LeaveOneOut, StratifiedKFold, train_test_split
+from sklearn.model_selection import GroupShuffleSplit, train_test_split
 from sklearn.preprocessing import StandardScaler
 from tqdm.auto import tqdm
 
 from helpers import list_files, read_file
-from model import HTMLFeatureExtractor, embed_texts, get_transformer, combine_texts, PhishBERTClassifier
+from features import HTMLFeatureExtractor
+from phishbert import PhishBERTClassifier
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────────────────────
 
 RANDOM_SEED = 42
 ARTIFACTS_DIR = Path(__file__).parent / "artifacts"
-EMB_CACHE      = ARTIFACTS_DIR / "emb_cache.npz"
-BERT_CLF_PATH  = ARTIFACTS_DIR / "bert_classifier.pt"
-BERT_CLF_META  = ARTIFACTS_DIR / "bert_clf_meta.npz"
-MINHASH_CACHE  = ARTIFACTS_DIR / "minhash_cache.pkl"
-_MINHASH_NUM_PERM = 128
+FEAT_CACHE    = ARTIFACTS_DIR / "feat_cache.npz"
+BERT_CLF_PATH = ARTIFACTS_DIR / "bert_classifier.pt"
+BERT_CLF_META = ARTIFACTS_DIR / "bert_clf_meta.npz"
+VOTER_A_PATH  = ARTIFACTS_DIR / "voter_a.joblib"
+VOTER_A_META  = ARTIFACTS_DIR / "voter_a_meta.npz"
+META_LR_PATH  = ARTIFACTS_DIR / "meta_lr.joblib"
+META_LR_META  = ARTIFACTS_DIR / "meta_lr_meta.npz"
+MINHASH_CACHE = ARTIFACTS_DIR / "minhash_cache.pkl"
 
-PREPROCESSING_VERSION = "v4"
+_MINHASH_NUM_PERM    = 128
+PREPROCESSING_VERSION = "v5"
+DECISION_THRESHOLD    = 0.50
 
+# ── Fixed XGBoost hyperparameters ─────────────────────────────────────────────
+# Empirically strong defaults for tabular phishing detection.
+# No random search needed — avoids 20×5-fold overhead on every run.
+XGB_PARAMS = {
+    "max_depth":        4,
+    "learning_rate":    0.05,
+    "subsample":        0.8,
+    "colsample_bytree": 0.8,
+    "min_child_weight": 10,
+    "gamma":            0.3,
+    "reg_alpha":        1.0,
+    "reg_lambda":       5.0,
+}
+XGB_N_ESTIMATORS   = 500
+XGB_EARLY_STOPPING = 50
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _xgb_gpu_kwargs() -> dict:
-    """Return XGBoost GPU kwargs when CUDA is available, empty dict otherwise."""
+    """Return XGBoost GPU kwargs when CUDA is available, empty dict otherwise.
+    Note: XGBoost does not support MPS — CPU is the correct fallback on Apple Silicon."""
     try:
         import torch
         if torch.cuda.is_available():
             return {"device": "cuda", "tree_method": "hist"}
-    except ImportError:
+    except Exception:
         pass
     return {}
 
-N_ESTIMATORS_MAX = 1000
-EARLY_STOPPING_ROUNDS = 100
-
-
-PARAM_GRID_NUMERIC = {
-    "max_depth": [3, 4, 5],
-    "learning_rate": [0.01, 0.05, 0.1],
-    "subsample": [0.7, 0.8, 1.0],
-    "colsample_bytree": [0.7, 0.8, 1.0],
-    "min_child_weight": [5, 10, 20],
-    "gamma": [0.3, 0.5, 1.0],
-    "reg_alpha": [0.1, 1.0, 5.0],
-    "reg_lambda": [2.0, 5.0, 10.0],
-}
-
-
-DECISION_THRESHOLD = 0.50
-
 
 def _model_stats(name: str, y_true, y_proba, threshold: float = DECISION_THRESHOLD) -> dict:
-    """Print and return precision-level stats for one model on a held-out set."""
+    """Print and return key metrics for one model on a held-out set."""
     auc  = roc_auc_score(y_true, y_proba)
     ap   = average_precision_score(y_true, y_proba)
     pred = (y_proba >= threshold).astype(int)
@@ -96,13 +132,17 @@ def _model_stats(name: str, y_true, y_proba, threshold: float = DECISION_THRESHO
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# MinHash deduplication  (near-duplicate grouping with persistent cache)
+# ─────────────────────────────────────────────────────────────────────────────
+
 class _UnionFind:
     def __init__(self, n):
         self._p = list(range(n))
 
     def find(self, x):
         while self._p[x] != x:
-            self._p[x] = self._p[self._p[x]]  # path halving
+            self._p[x] = self._p[self._p[x]]   # path halving
             x = self._p[x]
         return x
 
@@ -114,27 +154,25 @@ class _UnionFind:
 
 def _compute_minhash(html: str) -> np.ndarray:
     try:
-        soup = BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(html, "lxml")
         body = soup.find("body")
         text = body.get_text() if body else soup.get_text()
     except Exception:
         text = html
-
     normalised = re.sub(r"\s+", "", text).lower()
     m = MinHash(num_perm=_MINHASH_NUM_PERM)
     for i in range(len(normalised) - 4):
-        m.update(normalised[i : i + 5].encode("utf-8"))
+        m.update(normalised[i:i + 5].encode("utf-8"))
     return m.hashvalues.copy()
 
 
-def assign_groups(
-    paths: list, labels: list, raw_html: list, sim_threshold: float = 0.98
-):
+def assign_groups(paths: list, labels: list, raw_html: list, sim_threshold: float = 0.98):
+    """Group near-duplicate pages so they always land in the same split."""
     n = len(paths)
     print(f"[dedup] Assigning groups to {n} files…")
-
     uf = _UnionFind(n)
 
+    # Pass 1: exact MD5 duplicates
     md5_to_first: dict[str, int] = {}
     md5s: list[str] = []
     for i, html in enumerate(raw_html):
@@ -145,6 +183,7 @@ def assign_groups(
         else:
             md5_to_first[h] = i
 
+    # Pass 2: MinHash LSH near-duplicates (with persistent cache)
     mh_cache: dict[str, np.ndarray] = {}
     if MINHASH_CACHE.exists():
         try:
@@ -157,10 +196,9 @@ def assign_groups(
 
     miss_idx = [i for i in range(n) if md5s[i] not in mh_cache]
     if miss_idx:
-        n_hit = n - len(miss_idx)
         print(
             f"[dedup]   Computing MinHash for {len(miss_idx)} files "
-            f"({n_hit} served from cache)…"
+            f"({n - len(miss_idx)} served from cache)…"
         )
         new_hv = joblib.Parallel(n_jobs=-1, prefer="processes")(
             joblib.delayed(_compute_minhash)(raw_html[i]) for i in miss_idx
@@ -177,244 +215,94 @@ def assign_groups(
         m.hashvalues = mh_cache[md5].copy()
         return m
 
-    for cls in (0, 1):
-        cls_idx = [i for i in range(n) if labels[i] == cls]
-        if not cls_idx:
-            continue
-        lsh = MinHashLSH(threshold=sim_threshold, num_perm=_MINHASH_NUM_PERM)
-        for i in cls_idx:
-            mh = _mh(md5s[i])
-            for match_key in lsh.query(mh):
-                uf.union(i, int(match_key))
-            lsh.insert(str(i), mh)
+    # Single cross-label LSH pass: a phishing clone of a benign page must land
+    # in the same split regardless of its label, so we query/insert across the
+    # full dataset rather than within each class separately.
+    lsh = MinHashLSH(threshold=sim_threshold, num_perm=_MINHASH_NUM_PERM)
+    for i in range(n):
+        mh = _mh(md5s[i])
+        for match_key in lsh.query(mh):
+            uf.union(i, int(match_key))
+        lsh.insert(str(i), mh)
 
-    roots = [uf.find(i) for i in range(n)]
+    roots        = [uf.find(i) for i in range(n)]
     unique_roots = sorted(set(roots))
-    root_to_gid = {r: idx for idx, r in enumerate(unique_roots)}
-    group_ids = np.array([root_to_gid[r] for r in roots], dtype=np.int32)
-    n_groups = len(unique_roots)
+    root_to_gid  = {r: idx for idx, r in enumerate(unique_roots)}
+    group_ids    = np.array([root_to_gid[r] for r in roots], dtype=np.int32)
     print(
-        f"[dedup] {n} files → {n_groups} groups "
+        f"[dedup] {n} files → {len(unique_roots)} groups "
         f"(threshold={sim_threshold:.0%}, all files kept)"
     )
-
     return paths, labels, raw_html, group_ids
 
 
-def _eval_xgb_combo(combo, X_tr, y_tr, scale_pos_weight):
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_SEED)
-    fold_aucs = []
-    fold_iters = []
-    for fi_tr, fi_val in cv.split(X_tr, y_tr):
-        fi_es_tr, fi_es_stop = train_test_split(
-            fi_tr,
-            test_size=0.15,
-            stratify=y_tr[fi_tr],
-            random_state=RANDOM_SEED,
-        )
-        m = xgb.XGBClassifier(
-            **combo,
-            **_xgb_gpu_kwargs(),
-            n_estimators=N_ESTIMATORS_MAX,
-            early_stopping_rounds=EARLY_STOPPING_ROUNDS,
-            eval_metric="logloss",
-            scale_pos_weight=scale_pos_weight,
-            nthread=1,
-            random_state=RANDOM_SEED,
-        )
-        m.fit(
-            X_tr[fi_es_tr],
-            y_tr[fi_es_tr],
-            eval_set=[(X_tr[fi_es_stop], y_tr[fi_es_stop])],
-            verbose=False,
-        )
-        fold_aucs.append(
-            roc_auc_score(y_tr[fi_val], m.predict_proba(X_tr[fi_val])[:, 1])
-        )
-        fold_iters.append(m.best_iteration + 1)
-    return float(np.mean(fold_aucs)), int(round(np.mean(fold_iters)))
-
-
-def _oof_fold_worker(
-    fold_idx,
-    fi_sub_tr,
-    fi_sub_val,
-    fi_val,
-    Xn_tr,
-    Xb_tr,
-    y_tr,
-    params_a,
-    fold_spw,
-    xgb_nthread,
-):
-    tmp_a = xgb.XGBClassifier(
-        **params_a,
-        **_xgb_gpu_kwargs(),
-        n_estimators=N_ESTIMATORS_MAX,
-        early_stopping_rounds=EARLY_STOPPING_ROUNDS,
-        eval_metric="logloss",
-        scale_pos_weight=fold_spw,
-        nthread=xgb_nthread,
-        random_state=RANDOM_SEED,
-    )
-    tmp_a.fit(
-        Xn_tr[fi_sub_tr],
-        y_tr[fi_sub_tr],
-        eval_set=[(Xn_tr[fi_sub_val], y_tr[fi_sub_val])],
-        verbose=False,
-    )
-
-    # Voter B OOF proxy: scale frozen BERT embeddings + LogisticRegression.
-    # (Fast stand-in for the fine-tuned classifier; gives calibrated probs
-    #  for the meta-learner without running a full fine-tuning loop per fold.)
-    from sklearn.preprocessing import StandardScaler as _SS
-    _scaler_b = _SS()
-    Xb_sub_tr_s = _scaler_b.fit_transform(Xb_tr[fi_sub_tr])
-    Xb_val_s    = _scaler_b.transform(Xb_tr[fi_val])
-    tmp_b = LogisticRegression(
-        C=1.0, solver="saga", max_iter=3000,
-        class_weight="balanced", n_jobs=1, random_state=RANDOM_SEED,
-    )
-    tmp_b.fit(Xb_sub_tr_s, y_tr[fi_sub_tr])
-
-    p_a = tmp_a.predict_proba(Xn_tr[fi_val])[:, 1]
-    p_b = tmp_b.predict_proba(Xb_val_s)[:, 1]
-
-    return fold_idx, fi_val, p_a, p_b, tmp_a.best_iteration + 1
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Voter A tuning — XGBoost with random search + 5-fold CV
+# Main training pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 
-
-def tune_xgb(X_tr, y_tr, param_grid, label="", scale_pos_weight=1.0):
-    rng = np.random.default_rng(RANDOM_SEED)
-    param_keys = list(param_grid.keys())
-    sampled = [
-        {k: rng.choice(param_grid[k]).item() for k in param_keys} for _ in range(20)
-    ]
-
-    print(
-        f"[train] {label}: searching 20 param combos × 5 folds in parallel "
-        f"(scale_pos_weight={scale_pos_weight:.2f})…"
-    )
-    results = joblib.Parallel(n_jobs=-1, prefer="threads")(
-        joblib.delayed(_eval_xgb_combo)(combo, X_tr, y_tr, scale_pos_weight)
-        for combo in tqdm(sampled, desc=f"{label} search")
-    )
-
-    aucs = [r[0] for r in results]
-    iters = [r[1] for r in results]
-
-    best_idx = int(np.argmax(aucs))
-    best_score = float(aucs[best_idx])
-    best_params = sampled[best_idx]
-    best_n_trees = iters[best_idx]
-
-    print(
-        f"[train] {label} best CV AUC={best_score:.4f}  "
-        f"n_estimators={best_n_trees}  params: {best_params}"
-    )
-
-    # Refit on full X_tr — no val set, no early stopping
-    best_model = xgb.XGBClassifier(
-        **best_params,
-        **_xgb_gpu_kwargs(),
-        n_estimators=best_n_trees,
-        scale_pos_weight=scale_pos_weight,
-        random_state=RANDOM_SEED,
-    )
-    best_model.fit(X_tr, y_tr)
-    train_auc = roc_auc_score(y_tr, best_model.predict_proba(X_tr)[:, 1])
-    print(
-        f"[train] {label} train AUC={train_auc:.4f}  "
-        f"(n_estimators={best_n_trees} fixed from CV, val set untouched)"
-    )
-
-    return best_model, best_params, best_n_trees
-
-
-
-def main(training_root, fast=False):
+def main(training_root: str, fast: bool = False):
     ARTIFACTS_DIR.mkdir(exist_ok=True)
 
+    # ── 1. Discover files ─────────────────────────────────────────────────────
     print(f"[train] Scanning {training_root}…")
     paths, labels = list_files(training_root)
     print(
         f"[train] {len(paths)} files found — "
-        f"{sum(labels)} phishing, {sum(1 for lbl in labels if lbl == 0)} benign"
+        f"{sum(labels)} phishing, {sum(1 for l in labels if l == 0)} benign"
     )
 
-    # ── Feature cache (HTML features + embeddings + group ids) ────────────────
+    # ── 2. Feature cache ──────────────────────────────────────────────────────
     feat_cache_valid = False
-    if fast and EMB_CACHE.exists():
-        cache = np.load(EMB_CACHE, allow_pickle=True)
+    if fast and FEAT_CACHE.exists():
+        cache = np.load(FEAT_CACHE, allow_pickle=True)
         cached_version = str(cache.get("version", np.array("unknown")))
         if cached_version != PREPROCESSING_VERSION:
             print(
-                f"[train] ERROR: Feature cache built with '{cached_version}', "
-                f"current requires '{PREPROCESSING_VERSION}'.\n"
-                f"        Delete {EMB_CACHE} and re-run without --fast."
+                f"[train] Cache version mismatch ('{cached_version}' vs "
+                f"'{PREPROCESSING_VERSION}'). Delete {FEAT_CACHE} and re-run without --fast."
             )
             sys.exit(1)
-        if all(k in cache for k in ("emb_bert", "Xn_all", "numeric_cols", "group_ids", "vis", "struct_cores")):
-            n_cached = len(cache["emb_bert"])
-            if n_cached == len(paths):
-                print("[train] Loading full feature cache (--fast, skipping HTML read/extract/embed)…")
-                emb_bert     = cache["emb_bert"]
-                Xn_all       = cache["Xn_all"]
-                numeric_cols = [str(c) for c in cache["numeric_cols"]]
-                group_ids    = cache["group_ids"]
-                vis          = list(cache["vis"])
-                struct_cores = list(cache["struct_cores"])
-                y            = np.array(labels)
-                feat_cache_valid = True
-                print(
-                    f"[train] Cache loaded — {emb_bert.shape[0]} samples, "
-                    f"{len(numeric_cols)} numeric features, {emb_bert.shape[1]}-dim embeddings"
-                )
-            else:
-                print(
-                    f"[train] Feature cache has {n_cached} rows but dataset has {len(paths)}. "
-                    "Rebuilding…"
-                )
+        required = ("Xn_all", "numeric_cols", "group_ids", "vis", "struct_cores")
+        if all(k in cache for k in required) and len(cache["Xn_all"]) == len(paths):
+            print("[train] Loading feature cache (--fast, skipping HTML extraction)…")
+            Xn_all       = cache["Xn_all"]
+            numeric_cols = [str(c) for c in cache["numeric_cols"]]
+            group_ids    = cache["group_ids"]
+            vis          = list(cache["vis"])
+            struct_cores = list(cache["struct_cores"])
+            y            = np.array(labels)
+            feat_cache_valid = True
+            print(
+                f"[train] Cache loaded — {len(y)} samples, "
+                f"{len(numeric_cols)} numeric features"
+            )
         else:
-            print("[train] Feature cache missing numeric/group fields — rebuilding…")
+            print("[train] Feature cache stale — rebuilding…")
 
     if not feat_cache_valid:
+        # Read files in parallel — threading is fastest for I/O
         print("[train] Reading HTML files…")
         raw = joblib.Parallel(n_jobs=-1, backend="threading")(
             joblib.delayed(read_file)(p) for p in tqdm(paths, desc="Reading")
         )
 
-        paths, labels, raw, group_ids = assign_groups(
-            paths, labels, raw, sim_threshold=0.98
-        )
+        paths, labels, raw, group_ids = assign_groups(paths, labels, raw, sim_threshold=0.98)
         y = np.array(labels)
-        print(
-            f"[train] Dataset: {len(y)} files — {y.sum()} phishing, {(y == 0).sum()} benign"
-        )
+        print(f"[train] Dataset: {len(y)} files — {y.sum()} phishing, {(y == 0).sum()} benign")
 
+        # Extract numeric features + text strings — processes for CPU-bound parsing
         print("[train] Extracting HTML features…")
         extractor = HTMLFeatureExtractor()
         df_num, extras = extractor.transform(raw)
-        vis = extras["visible_texts"]
+        vis          = extras["visible_texts"]
         struct_cores = extras["struct_cores"]
+        del raw   # free 6 GB+ of raw HTML strings before model work starts
         numeric_cols = list(df_num.columns)
-        Xn_all = df_num[numeric_cols].fillna(0).values.astype(np.float32)
+        Xn_all       = df_num[numeric_cols].fillna(0).values.astype(np.float32)
         print(f"[train] {len(numeric_cols)} numeric features extracted")
 
-        tokenizer, transformer, device = get_transformer()
-        print("[train] Embedding visible text + structural core…")
-        n = len(vis)
-        all_embs = embed_texts(
-            tokenizer, transformer, device, vis + struct_cores, desc="Embedding"
-        )
-        emb_bert = np.hstack([all_embs[:n], all_embs[n:]]).astype(np.float32)
         np.savez_compressed(
-            EMB_CACHE,
-            emb_bert=emb_bert,
+            FEAT_CACHE,
             Xn_all=Xn_all,
             numeric_cols=np.array(numeric_cols),
             group_ids=group_ids,
@@ -422,15 +310,12 @@ def main(training_root, fast=False):
             struct_cores=np.array(struct_cores, dtype=object),
             version=np.array(PREPROCESSING_VERSION),
         )
-        print(
-            f"[train] Feature cache saved → {EMB_CACHE}  "
-            f"[preprocessing={PREPROCESSING_VERSION}]"
-        )
+        print(f"[train] Feature cache saved → {FEAT_CACHE}  [v={PREPROCESSING_VERSION}]")
 
-    print(f"[train] Feature shapes — numeric: {Xn_all.shape}, bert: {emb_bert.shape}")
+    # ── 3. Group-aware train / val / test split  (60 / 20 / 20) ──────────────
+    # Groups ensure near-duplicate pages never straddle splits, preventing leakage.
     idx = np.arange(len(y))
-
-    gss = GroupShuffleSplit(n_splits=1, test_size=0.60, random_state=RANDOM_SEED)
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.40, random_state=RANDOM_SEED)
     tr_idx, temp_idx = next(gss.split(idx, y, group_ids))
 
     gss2 = GroupShuffleSplit(n_splits=1, test_size=0.50, random_state=RANDOM_SEED)
@@ -438,270 +323,208 @@ def main(training_root, fast=False):
         gss2.split(np.arange(len(temp_idx)), y[temp_idx], group_ids[temp_idx])
     )
     val_idx = temp_idx[val_loc]
-    te_idx = temp_idx[te_loc]
+    te_idx  = temp_idx[te_loc]
 
-    Xn_tr_raw = Xn_all[tr_idx]
-    Xn_val_raw = Xn_all[val_idx]
-    Xn_te_raw = Xn_all[te_idx]
-    Xb_tr_raw = emb_bert[tr_idx]
-    Xb_val_raw = emb_bert[val_idx]
-    Xb_te_raw = emb_bert[te_idx]
     y_tr, y_val, y_te = y[tr_idx], y[val_idx], y[te_idx]
-
     print(
         f"[train] Split — train={len(y_tr)} ({y_tr.sum()} phish), "
         f"val={len(y_val)} ({y_val.sum()} phish), "
         f"test={len(y_te)} ({y_te.sum()} phish)"
     )
 
-    neg_count = int((y_tr == 0).sum())
-    pos_count = int((y_tr == 1).sum())
-    spw = neg_count / pos_count
-    print(
-        f"[train] Class weight — scale_pos_weight={spw:.3f} "
-        f"({neg_count} safe / {pos_count} phish)"
+    # ── 4. Voter A: XGBoost on scaled numeric features ────────────────────────
+    xgb_cached = False
+    if fast and VOTER_A_PATH.exists() and VOTER_A_META.exists():
+        meta_a = np.load(VOTER_A_META)
+        if np.array_equal(meta_a.get("tr_idx", np.array([])), tr_idx):
+            print("[train] Loading cached Voter A (--fast)…")
+            bundle_a  = joblib.load(VOTER_A_PATH)
+            xgb_a     = bundle_a["xgb_a"]
+            scaler    = bundle_a["scaler"]
+            n_trees   = int(bundle_a["n_trees"])
+            Xn_val    = scaler.transform(Xn_all[val_idx]).astype(np.float32)
+            Xn_te     = scaler.transform(Xn_all[te_idx]).astype(np.float32)
+            xgb_cached = True
+
+    if not xgb_cached:
+        neg_count = int((y_tr == 0).sum())
+        pos_count = int((y_tr == 1).sum())
+        spw       = neg_count / pos_count
+        print(f"[train] scale_pos_weight={spw:.3f}  ({neg_count} safe / {pos_count} phish)")
+
+        scaler = StandardScaler()
+        Xn_tr  = scaler.fit_transform(Xn_all[tr_idx]).astype(np.float32)
+        Xn_val = scaler.transform(Xn_all[val_idx]).astype(np.float32)
+        Xn_te  = scaler.transform(Xn_all[te_idx]).astype(np.float32)
+
+        # Carve 15 % of train for XGBoost early stopping (isolated from meta-learner)
+        es_tr_idx, es_val_idx = train_test_split(
+            np.arange(len(y_tr)), test_size=0.15, stratify=y_tr, random_state=RANDOM_SEED
+        )
+
+        print("[train] Training Voter A — XGBoost…")
+        xgb_a = xgb.XGBClassifier(
+            **XGB_PARAMS,
+            **_xgb_gpu_kwargs(),
+            n_estimators=XGB_N_ESTIMATORS,
+            early_stopping_rounds=XGB_EARLY_STOPPING,
+            eval_metric="logloss",
+            scale_pos_weight=spw,
+            random_state=RANDOM_SEED,
+        )
+        xgb_a.fit(
+            Xn_tr[es_tr_idx], y_tr[es_tr_idx],
+            eval_set=[(Xn_tr[es_val_idx], y_tr[es_val_idx])],
+            verbose=False,
+        )
+        n_trees = xgb_a.best_iteration + 1
+        joblib.dump({"xgb_a": xgb_a, "scaler": scaler, "n_trees": n_trees}, VOTER_A_PATH)
+        np.savez(VOTER_A_META, tr_idx=tr_idx)
+        print(f"[train] Voter A saved → {VOTER_A_PATH}")
+
+    xgb_val_auc = roc_auc_score(y_val, xgb_a.predict_proba(Xn_val)[:, 1])
+    print(f"[train] Voter A — {n_trees} trees  val AUC={xgb_val_auc:.4f}")
+
+    # ── 5. Voter B: Fine-tuned RoBERTa ────────────────────────────────────────
+    # Carve 15 % of train for RoBERTa early stopping — same pattern as XGBoost.
+    # combined_val / y_val are kept 100 % unseen until the meta-learner step.
+    bert_es_tr_idx, bert_es_val_idx = train_test_split(
+        np.arange(len(y_tr)), test_size=0.15, stratify=y_tr,
+        random_state=RANDOM_SEED + 1,   # different seed to XGBoost's carve-out
     )
 
-    print("[train] Fitting StandardScaler on numeric training features…")
-    scaler = StandardScaler()
-    Xn_tr = scaler.fit_transform(Xn_tr_raw).astype(np.float32)
-    Xn_val = scaler.transform(Xn_val_raw).astype(np.float32)
-    Xn_te = scaler.transform(Xn_te_raw).astype(np.float32)
+    # Fix 1: pass only visible text — struct_core moves to XGBoost numeric features.
+    # This prevents malicious JS/HTML payloads from eating the token budget.
+    combined_tr     = [vis[i] for i in tr_idx]
+    combined_val    = [vis[i] for i in val_idx]
+    combined_te     = [vis[i] for i in te_idx]
+    combined_bert_es_tr  = [combined_tr[i] for i in bert_es_tr_idx]
+    combined_bert_es_val = [combined_tr[i] for i in bert_es_val_idx]
 
-    # Xb_tr/val/te = raw frozen BERT embeddings used by the OOF LR proxy
-    Xb_tr  = emb_bert[tr_idx]
-    Xb_val = emb_bert[val_idx]
-    Xb_te  = emb_bert[te_idx]
-
-    print("[train] Tuning Voter A — XGBoost on scaled numeric features…")
-    xgb_a, params_a, n_trees_a = tune_xgb(
-        Xn_tr,
-        y_tr,
-        PARAM_GRID_NUMERIC,
-        "Voter A (numeric)",
-        scale_pos_weight=spw,
-    )
-
-    # ── Voter B: fine-tuned RoBERTa classification head ───────────────────────
-    # Build text inputs for train / val / test splits
-    combined_tr  = [combine_texts(vis[i], struct_cores[i]) for i in tr_idx]
-    combined_val = [combine_texts(vis[i], struct_cores[i]) for i in val_idx]
-    combined_te  = [combine_texts(vis[i], struct_cores[i]) for i in te_idx]
-
-    bert_clf_cached = False
+    bert_cached = False
     if fast and BERT_CLF_PATH.exists() and BERT_CLF_META.exists():
         meta = np.load(BERT_CLF_META)
         if np.array_equal(meta.get("tr_idx", np.array([])), tr_idx):
-            print("[train] Loading cached PhishBERT classifier (--fast)…")
-            bert_clf = PhishBERTClassifier.load(BERT_CLF_PATH)
-            bert_clf_cached = True
+            print("[train] Loading cached PhishBERT (--fast)…")
+            bert_clf    = PhishBERTClassifier.load(BERT_CLF_PATH)
+            bert_cached = True
 
-    if not bert_clf_cached:
-        print("[train] Fine-tuning Voter B — PhishBERT (RoBERTa + classification head)…")
+    if not bert_cached:
+        print("[train] Fine-tuning Voter B — RoBERTa…")
         bert_clf = PhishBERTClassifier(random_state=RANDOM_SEED)
-        bert_clf.fit(combined_tr, y_tr, val_texts=combined_val, val_y=y_val)
+        bert_clf.fit(
+            combined_bert_es_tr,  y_tr[bert_es_tr_idx],
+            val_texts=combined_bert_es_val, val_y=y_tr[bert_es_val_idx],
+        )
         bert_clf.save(BERT_CLF_PATH)
         np.savez(BERT_CLF_META, tr_idx=tr_idx)
         print(f"[train] PhishBERT saved → {BERT_CLF_PATH}")
 
-    print("[train] Generating out-of-fold predictions for meta-learner…")
-    print(
-        "[train]   OOF sub-split: 85% fold-train / 15% fold-early-stop "
-        "(fi_sub_val carved from fi_tr, never from held-out val set)."
-    )
+    bert_val_auc = roc_auc_score(y_val, bert_clf.predict_proba(combined_val)[:, 1])
+    print(f"[train] Voter B val AUC={bert_val_auc:.4f}")
 
-    kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_SEED)
-    fold_configs = []
-    for fold, (fi_tr, fi_val) in enumerate(kf.split(Xn_tr, y_tr)):
-        fi_sub_tr, fi_sub_val = train_test_split(
-            fi_tr,
-            test_size=0.15,
-            stratify=y_tr[fi_tr],
-            random_state=RANDOM_SEED + fold,
-        )
-        fold_spw = float((y_tr[fi_sub_tr] == 0).sum()) / max(
-            float((y_tr[fi_sub_tr] == 1).sum()), 1
-        )
-        fold_configs.append((fold, fi_sub_tr, fi_sub_val, fi_val, fold_spw))
+    # ── 6. Meta-learner: LR on val-set predictions ────────────────────────────
+    # Both voters were trained exclusively on tr_idx → val predictions are unbiased.
+    # Val predictions are always computed — needed for the generalisation gap report.
+    P_xgb_val  = xgb_a.predict_proba(Xn_val)[:, 1]
+    P_bert_val = bert_clf.predict_proba(combined_val)[:, 1]
+    meta_val   = np.column_stack([P_xgb_val, P_bert_val]).astype(np.float32)
 
-    n_cores = os.cpu_count() or 4
-    xgb_nthread = max(1, n_cores // 5)
-    print(
-        f"[train]   Running 5 OOF folds in parallel "
-        f"(xgb_nthread={xgb_nthread} per fold, {n_cores} cores total)…"
-    )
+    meta_cached = False
+    if fast and META_LR_PATH.exists() and META_LR_META.exists():
+        meta_m = np.load(META_LR_META)
+        if np.array_equal(meta_m.get("tr_idx", np.array([])), tr_idx):
+            print("[train] Loading cached Meta LR (--fast)…")
+            meta_lr     = joblib.load(META_LR_PATH)
+            meta_cached = True
 
-    oof_results = joblib.Parallel(n_jobs=5, prefer="threads")(
-        joblib.delayed(_oof_fold_worker)(
-            fold,
-            fi_sub_tr,
-            fi_sub_val,
-            fi_val,
-            Xn_tr,
-            Xb_tr,
-            y_tr,
-            params_a,
-            fold_spw,
-            xgb_nthread,
-        )
-        for fold, fi_sub_tr, fi_sub_val, fi_val, fold_spw in fold_configs
-    )
-
-    oof_meta = np.zeros((len(y_tr), 2), dtype=np.float32)
-    for fold_idx, fi_val, p_a, p_b, best_iter in sorted(
-        oof_results, key=lambda r: r[0]
-    ):
-        oof_meta[fi_val, 0] = p_a
-        oof_meta[fi_val, 1] = p_b
-        print(
-            f"[train]   fold {fold_idx + 1}/5 — "
-            f"Voter A stopped @{best_iter} trees  (oof={len(fi_val)})"
-        )
-
-    val_meta = np.column_stack(
-        [
-            xgb_a.predict_proba(Xn_val)[:, 1],
-            bert_clf.predict_proba(combined_val)[:, 1],
-        ]
-    ).astype(np.float32)
-
-    print("[train] Training LogisticRegression meta-learner on OOF [P_xgb, P_lr]…")
-    meta_lr = LogisticRegression(
-        C=1.0,
-        l1_ratio=0,
-        solver="lbfgs",
-        max_iter=1000,
-        class_weight="balanced",
-        random_state=RANDOM_SEED,
-    )
-    meta_lr.fit(oof_meta, y_tr)
-
-    # LOO CV on meta features — 2D input so each LR fit is sub-millisecond.
-    print("[train] Meta LR — running LOO CV on OOF meta features…")
-    loo = LeaveOneOut()
-    loo_meta_preds = np.zeros(len(y_tr))
-    for _tr_idx, _te_idx in loo.split(oof_meta):
-        _m = LogisticRegression(
+    if not meta_cached:
+        print("[train] Training meta LogisticRegression on [P_xgb, P_roberta] from val set…")
+        meta_lr = LogisticRegression(
             C=1.0, solver="lbfgs", max_iter=1000,
             class_weight="balanced", random_state=RANDOM_SEED,
         )
-        _m.fit(oof_meta[_tr_idx], y_tr[_tr_idx])
-        loo_meta_preds[_te_idx] = _m.predict_proba(oof_meta[_te_idx])[:, 1]
-    meta_loo_auc = roc_auc_score(y_tr, loo_meta_preds)
+        meta_lr.fit(meta_val, y_val)
+        joblib.dump(meta_lr, META_LR_PATH)
+        np.savez(META_LR_META, tr_idx=tr_idx)
+        print(f"[train] Meta LR saved → {META_LR_PATH}")
 
-    meta_val_auc = roc_auc_score(y_val, meta_lr.predict_proba(val_meta)[:, 1])
-    print(
-        f"[train] Meta LR LOO AUC={meta_loo_auc:.4f}  "
-        f"val AUC={meta_val_auc:.4f}"
-        + (" ⚠ overfit risk" if meta_loo_auc - meta_val_auc > 0.03 else " ✓")
-    )
-    meta_oof_auc = roc_auc_score(y_tr, meta_lr.predict_proba(oof_meta)[:, 1])
+    all_fast = fast and xgb_cached and bert_cached and meta_cached
+    if all_fast:
+        print("[train] All models loaded from cache — jumping straight to test evaluation.")
 
-    lr_meta_coef = meta_lr.coef_[0].tolist()
-    print(
-        f"[train] Meta LR weights — P_xgb: {lr_meta_coef[0]:.3f}, "
-        f"P_bert: {lr_meta_coef[1]:.3f}"
-    )
+    lr_coef = meta_lr.coef_[0].tolist()
+    print(f"[train] Meta LR weights — P_xgb: {lr_coef[0]:.3f}, P_roberta: {lr_coef[1]:.3f}")
 
-    # ── Platt calibration on val set (val used exactly once) ─────────────────
-    print("[train] Calibrating meta-model (Platt scaling) on val set…")
-    _raw_val = meta_lr.predict_proba(val_meta)[:, 1].reshape(-1, 1)
-    meta_calibrator = LogisticRegression(
-        C=1e10,
-        solver="lbfgs",
-        max_iter=1000,
-    ).fit(_raw_val, y_val)
+    meta_val_auc = roc_auc_score(y_val, meta_lr.predict_proba(meta_val)[:, 1])
+    print(f"[train] Meta LR val AUC={meta_val_auc:.4f}")
 
-    cal_val_auc = roc_auc_score(
-        y_val,
-        meta_calibrator.predict_proba(_raw_val)[:, 1],
-    )
+    # ── 7. Final test-set evaluation ──────────────────────────────────────────
+    # meta_lr (LogisticRegression) outputs natively calibrated probabilities —
+    # no Platt scaling step needed.
+    P_xgb_te  = xgb_a.predict_proba(Xn_te)[:, 1]
+    P_bert_te = bert_clf.predict_proba(combined_te)[:, 1]
+    meta_te   = np.column_stack([P_xgb_te, P_bert_te]).astype(np.float32)
+    y_final   = meta_lr.predict_proba(meta_te)[:, 1]
 
-    # LOO CV on Platt calibrator — 1D input, val set size, essentially instant.
-    print("[train] Platt calibrator — running LOO CV on val set…")
-    loo_cal_preds = np.zeros(len(y_val))
-    for _tr_idx, _te_idx in loo.split(_raw_val):
-        _cal = LogisticRegression(C=1e10, solver="lbfgs", max_iter=1000)
-        _cal.fit(_raw_val[_tr_idx], y_val[_tr_idx])
-        loo_cal_preds[_te_idx] = _cal.predict_proba(_raw_val[_te_idx])[:, 1]
-    cal_loo_auc = roc_auc_score(y_val, loo_cal_preds)
-
-    print(
-        f"[train] Calibrator LOO AUC={cal_loo_auc:.4f}  "
-        f"fitted val AUC={cal_val_auc:.4f}"
-        + (" ⚠ calibration unstable" if abs(cal_loo_auc - cal_val_auc) > 0.02 else " ✓")
-    )
-
-    te_a = xgb_a.predict_proba(Xn_te)[:, 1]
-    te_b = bert_clf.predict_proba(combined_te)[:, 1]
-    meta_te = np.column_stack([te_a, te_b]).astype(np.float32)
-
-    _raw_te = meta_lr.predict_proba(meta_te)[:, 1].reshape(-1, 1)
-    y_proba_final = meta_calibrator.predict_proba(_raw_te)[:, 1]
-    auc = roc_auc_score(y_te, y_proba_final)
-    auc_xgb = roc_auc_score(y_te, te_a)
-    auc_lr = roc_auc_score(y_te, te_b)
-    gap_final = cal_val_auc - auc
+    test_auc = roc_auc_score(y_te, y_final)
+    gap      = meta_val_auc - test_auc
 
     print(f"\n[train] ══════════════════════════════════════════════════════")
     print(f"[train] Final Test Results  (n={len(y_te)}, threshold={DECISION_THRESHOLD})")
     print(f"[train] ══════════════════════════════════════════════════════")
-    stats_a    = _model_stats("Voter A — XGBoost (numeric features)", y_te, te_a)
-    stats_b    = _model_stats("Voter B — PhishBERT (fine-tuned RoBERTa)", y_te, te_b)
-    stats_meta = _model_stats("Meta blend (Platt-calibrated)",        y_te, y_proba_final)
+    stats_a    = _model_stats("Voter A — XGBoost (numeric features)", y_te, P_xgb_te)
+    stats_b    = _model_stats("Voter B — RoBERTa (fine-tuned)",       y_te, P_bert_te)
+    stats_meta = _model_stats("Meta blend (LR)",                      y_te, y_final)
     print(
-        f"\n[train]   Val AUC (calibrated):              {cal_val_auc:.4f}"
-        f"\n[train]   Meta LR LOO AUC (train):           {meta_loo_auc:.4f}"
-        f"\n[train]   Calibrator LOO AUC (val):          {cal_loo_auc:.4f}"
-        f"\n[train]   Generalisation gap (val→test):     {gap_final:.4f}"
-        + (" ⚠ possible overfit" if gap_final > 0.03 else " ✓ generalising well")
+        f"\n[train]   Val AUC:                        {meta_val_auc:.4f}"
+        f"\n[train]   Test AUC:                       {test_auc:.4f}"
+        f"\n[train]   Generalisation gap (val→test):  {gap:.4f}"
+        + (" ⚠ possible overfit" if gap > 0.03 else " ✓ generalising well")
     )
 
-    model_path = ARTIFACTS_DIR / "model.joblib"
+    # ── 8. Save model bundle + training summary ───────────────────────────────
     bundle = {
-        # ── Base voters ───────────────────────────────────────────────────────
-        "xgb_numeric":  xgb_a,      # Voter A: XGBoost on scaled numerics
-        "bert_clf_path": str(BERT_CLF_PATH),  # Voter B: PhishBERT (loaded separately)
-        # ── Meta layer ────────────────────────────────────────────────────────
-        "meta_lr":          meta_lr,         # LR meta-learner fit on OOF
-        "meta_calibrator":  meta_calibrator, # Platt scaler fit on val
-        # ── Preprocessing transforms (fit on train only) ──────────────────────
-        "scaler": scaler,
-        # ── Metadata ─────────────────────────────────────────────────────────
+        # Voters
+        "xgb_numeric":    xgb_a,
+        "bert_clf_path":  str(BERT_CLF_PATH),
+        # Meta layer
+        "meta_lr":        meta_lr,
+        # Preprocessing (fit on train only)
+        "scaler":         scaler,
+        # Metadata
         "numeric_columns":  numeric_cols,
         "transformer_name": "xlm-roberta-base",
         "voter_b_type":     "PhishBERTClassifier",
-        "meta_lr_coef":     lr_meta_coef,
+        "meta_lr_coef":     lr_coef,
     }
+    model_path = ARTIFACTS_DIR / "model.joblib"
     joblib.dump(bundle, model_path)
     print(f"[train] Model bundle saved → {model_path}")
 
     summary = {
-        "n_files": int(len(y)),
+        "n_files":    int(len(y)),
         "n_phishing": int(y.sum()),
-        "n_benign": int((y == 0).sum()),
+        "n_benign":   int((y == 0).sum()),
         "decision_threshold": DECISION_THRESHOLD,
-        "voter_a_numeric":    stats_a,
-        "voter_b_phishbert":  stats_b,
-        "meta_calibrated":   stats_meta,
-        "meta_oof_auc":      round(float(meta_oof_auc), 4),
-        "meta_loo_auc":      round(float(meta_loo_auc), 4),
-        "meta_val_auc":      round(float(meta_val_auc), 4),
-        "cal_val_auc":       round(float(cal_val_auc),  4),
-        "cal_loo_auc":       round(float(cal_loo_auc),  4),
-        "generalisation_gap_val_test": round(float(gap_final), 4),
-        "params_voter_a": params_a,
-        "n_trees_voter_a": n_trees_a,
-        "voter_b_type": "PhishBERTClassifier",
-        "bert_clf_path": str(BERT_CLF_PATH),
-        "meta_lr_coef": lr_meta_coef,
-        "numeric_columns": numeric_cols,
+        "voter_a":            stats_a,
+        "voter_b":            stats_b,
+        "meta_lr":            stats_meta,
+        "meta_val_auc":       round(float(meta_val_auc), 4),
+        "test_auc":           round(float(test_auc),     4),
+        "generalisation_gap": round(float(gap),          4),
+        "xgb_params":         XGB_PARAMS,
+        "xgb_n_trees":        n_trees,
+        "voter_b_type":       "PhishBERTClassifier",
+        "bert_clf_path":      str(BERT_CLF_PATH),
+        "meta_lr_coef":       lr_coef,
+        "numeric_columns":    numeric_cols,
     }
     with open(ARTIFACTS_DIR / "training_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
 
     print(f"[train] Summary saved → {ARTIFACTS_DIR / 'training_summary.json'}")
-    print(f"[train] Done — Calibrated Meta AUC={auc:.4f}")
+    print(f"[train] Done — Test AUC={test_auc:.4f}")
 
 
 if __name__ == "__main__":
